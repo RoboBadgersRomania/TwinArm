@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Documentation/assets/banner.svg" alt="TwinArm: teach-by-demonstration 6-DOF robotic arm with a passive wireless master" width="100%">
+  <img src="Documentation/assets/banner.svg" alt="TwinArm: teach-by-demonstration 5-DOF robotic arm with a passive wireless master" width="100%">
 </p>
 
 <p align="center">
@@ -33,7 +33,7 @@
 <div align="center">
 <table>
   <tr>
-    <td align="center" width="25%"><h3>6 + 1</h3><sub>DOF + gripper</sub></td>
+    <td align="center" width="25%"><h3>5 + 1</h3><sub>DOF + gripper</sub></td>
     <td align="center" width="25%"><h3>≈ 13.9 ms</h3><sub>end-to-end latency</sub></td>
     <td align="center" width="25%"><h3>200 Hz</h3><sub>follower control rate</sub></td>
     <td align="center" width="25%"><h3>0.022°</h3><sub>master encoder resolution</sub></td>
@@ -47,7 +47,7 @@
 
 > **The problem.** How can a non-expert operator command a high-torque robotic arm in real time, intuitively and from a safe distance, and how can the demonstrated motion be stored and reproduced autonomously, without a PC and without writing code?
 
-**TwinArm** is a 6-DOF leader–follower platform. The operator moves a light, **passive master arm** that is a scaled geometric copy of the robot. Contactless absolute magnetic encoders on every master joint are read by an Arduino Uno, and the joint angles travel over a **433 MHz LoRa link** to a **Teensy 4.1**, which drives four FOC brushless actuators over **CAN** and three PWM servos (base, wrist roll, gripper). Every demonstration can be **recorded on board and replayed autonomously**, faster or slower, which is the first step towards learning from demonstration on embedded hardware.
+**TwinArm** is a 5-DOF + gripper leader–follower platform: base turret, shoulder, elbow, wrist pitch and wrist roll. The operator moves a light, **passive master arm** that is a scaled geometric copy of the robot. Contactless absolute magnetic encoders on every master joint are read by an Arduino Uno, and the joint angles travel over a **433 MHz LoRa link** to a **Teensy 4.1**, which drives four FOC brushless actuators over **CAN** (shoulder, elbow, wrist pitch, wrist roll) and two PWM servos (base turret, gripper). Every demonstration can be **recorded on board and replayed autonomously**, faster or slower, which is the first step towards learning from demonstration on embedded hardware.
 
 > [!NOTE]
 > **Project status.** The full system is designed in the [technical report](Documentation/TwinArm___RoboChallenge.pdf). This repository currently holds the follower-side bench firmware (CAN actuator driver, homing and jog console) and hardware unit tests. Values marked *estimate* will be verified on the prototype.
@@ -82,13 +82,13 @@ TwinArm combines a **scaled** passive master, a **wireless** LoRa link, **indust
 %%{init: {"theme": "base", "themeVariables": {"fontFamily": "Segoe UI, Helvetica, Arial, sans-serif", "primaryColor": "#0B0B0B", "primaryTextColor": "#F2E8D5", "primaryBorderColor": "#A4161A", "lineColor": "#A4161A", "textColor": "#F2E8D5", "edgeLabelBackground": "#1A1212", "clusterBkg": "#F2E8D5", "clusterBorder": "#8B0000", "titleColor": "#0B0B0B"}}}%%
 flowchart TB
   subgraph MASTER["MASTER · operator side"]
-    ENC["6× MT6701<br/>magnetic encoders"] -- SSI --> UNO["Arduino Uno R3<br/>filter · frame · CRC-16"]
+    ENC["6× MT6701<br/>5 joints + gripper"] -- SSI --> UNO["Arduino Uno R3<br/>filter · frame · CRC-16"]
     UNO -- UART --> TX["LightGateway TX"]
   end
   TX -. "LoRa 433 MHz · 18 B / 5 ms" .-> RX
   subgraph FOLLOWER["FOLLOWER · robot side"]
     RX["LightGateway RX"] -- UART --> T41["Teensy 4.1<br/>mapping · limits · record / replay"]
-    T41 -- PWM --> SRV["2× DS5180 (J1, J6)<br/>DS3218 gripper"]
+    T41 -- PWM --> SRV["DS5180 turret (J1)<br/>DS3218 gripper"]
     T41 -- "TX / RX" --> XCVR["TJA1051<br/>CAN transceiver"]
     XCVR == "CAN 1 Mbit/s" ==> ACT["3× GIM8108-8 (J2–J4)<br/>GIM3505-8 (J5)"]
     BAT["6S LiPo 22.2 V<br/>fuse · E-stop"] -- "22.2 V" --> ACT
@@ -99,7 +99,7 @@ flowchart TB
 
 1. **Power on, release the E-stop.** The follower enters `INIT` and reads the absolute positions of all CAN actuators. Both arms use absolute encoders, so **no homing is needed**.
 2. **Align and enable.** The *alignment interlock* allows `HOLD → LIVE` only when every master joint is close to the follower pose; status LEDs on the master show which joint still needs aligning, so mirroring never starts with a jump.
-3. **Every 5 ms the master** reads its six encoders over SSI, applies the harmonic calibration and a low-pass filter, and sends an **18-byte frame**: header, sequence number, mode, six 16-bit angles and a CRC-16.
+3. **Every 5 ms the master** reads its six encoders (five joints and the gripper trigger) over SSI, applies the harmonic calibration and a low-pass filter, and sends an **18-byte frame**: header, sequence number, mode, six 16-bit values (five joint angles and the gripper) and a CRC-16.
 4. **The follower** checks CRC and sequence, resets the watchdog, maps master to follower, applies joint limits, a rate limiter and gravity feed-forward, and sends set-points. The **FOC position loop runs inside each actuator**.
 5. **In `RECORD`**, the commanded trajectory $(t_k,\mathbf q_k)$ is stored at 100 Hz, about **72 kB per minute**.
 6. **In `REPLAY`**, the stored trajectory is smoothed with a zero-phase filter, spline-interpolated and optionally time-scaled. Every move to a new pose without the master uses a **minimum-jerk** transition.
@@ -145,34 +145,33 @@ stateDiagram-v2
 | Component | Role | Key parameters |
 |---|---|---|
 | **Teensy 4.1** | follower controller | i.MX RT1062 Cortex-M7 @ 600 MHz, 1 MB RAM, 8 MB flash, 3 CAN controllers, microSD |
-| **3× SteadyWin GIM8108-8** | follower joints 2–4 | integrated FOC driver (GDZ468), 8:1 planetary gear, 7.5 N·m rated / 22 N·m stall, CAN |
-| **SteadyWin GIM3505-8 V1.1** | follower joint 5 | integrated FOC driver (GDS34), 8:1 planetary gear, 0.65 N·m rated / 1.27 N·m stall, 97 g, 12–40 V, CAN |
-| **2× DS5180 servo** | base (J1), wrist roll (J6) | 7.65 N·m at 7.4 V, 0.17 s/60°, PWM 500–2500 µs, 3 µs dead band |
+| **3× SteadyWin GIM8108-8** | shoulder, elbow, wrist pitch (J2–J4) | integrated FOC driver (GDZ468), 8:1 planetary gear, 7.5 N·m rated / 22 N·m stall, CAN |
+| **SteadyWin GIM3505-8 V1.1** | wrist roll (J5) | integrated FOC driver (GDS34), 8:1 planetary gear, 0.65 N·m rated / 1.27 N·m stall, 97 g, 12–40 V, CAN |
+| **DS5180 servo** | base turret (J1) | 7.65 N·m at 7.4 V, 0.17 s/60°, PWM 500–2500 µs, 3 µs dead band |
 | **DS3218 servo** | gripper | PWM, metal gears |
 | **TJA1051** | CAN transceiver | ISO 11898-2 physical layer, up to 5 Mbit/s |
-| **6× MT6701** | master joint encoders | Hall-based, 14-bit absolute, SSI / I²C, < 2 µs delay |
+| **6× MT6701** | master encoders: five joints and the gripper trigger | Hall-based, 14-bit absolute, SSI / I²C, < 2 µs delay |
 | **Arduino Uno R3** | master controller | ATmega328P @ 16 MHz; reads encoders, builds radio frames |
 | **2× LightGateway 1.0** | radio link | ESP32-S3 + EBYTE E22-400M22S (SX1268), LoRa 433 MHz, up to 22 dBm |
 | **6S LiPo 5000 mAh 50C** | follower power | 22.2 V nominal (25.2 V full), 111 Wh |
 
-Each SteadyWin actuator integrates motor, FOC driver, gearbox and absolute encoder in one housing, so **every joint is a single CAN node**. The heavy GIM8108-8 units carry the shoulder, elbow and first wrist joint; the light GIM3505-8 moves the second wrist joint to keep mass, and therefore shoulder torque, low.
+Each SteadyWin actuator integrates motor, FOC driver, gearbox and absolute encoder in one housing, so **every joint is a single CAN node**. The heavy GIM8108-8 units carry the shoulder, elbow and wrist pitch; the light GIM3505-8 turns the wrist roll, to keep mass, and therefore shoulder torque, low.
 
 ### Kinematic structure
 
-Both arms share an anthropomorphic 6-DOF structure with a spherical wrist. The master is a geometric copy of the follower scaled by $\kappa<1$; uniform scaling leaves the joint angles unchanged, so both arms share the same joint variables $q_1\dots q_6$. Maximum horizontal reach from the shoulder axis is $a_2+d_4+d_6=$ **0.55 m**.
+The arm has five joints: a base turret (yaw), then shoulder, elbow and wrist pitch, which all pitch in one vertical plane, and a wrist roll about the tool axis, plus the gripper. The links are 300 mm (upper arm), 300 mm (forearm) and 142 mm (wrist pitch axis to the tool tip). The master is a geometric copy of the follower scaled by $\kappa<1$; uniform scaling leaves the joint angles unchanged, so both arms share the same joint variables $q_1\dots q_5$. Maximum horizontal reach from the shoulder axis is $a_2+a_3+d_5=$ **0.74 m**.
 
 <div align="center">
 
-| $i$ | $a_i$ [mm] | $\alpha_i$ | $d_i$ [mm] | $\theta_i$ |
-|:-:|:-:|:-:|:-:|:-:|
-| 1 | 0 | $\pi/2$ | $d_1=300$ | $q_1$ |
-| 2 | $a_2=300$ | 0 | 0 | $q_2$ |
-| 3 | 0 | $\pi/2$ | 0 | $q_3$ |
-| 4 | 0 | $-\pi/2$ | $d_4=150$ | $q_4$ |
-| 5 | 0 | $\pi/2$ | 0 | $q_5$ |
-| 6 | 0 | 0 | $d_6=100$ | $q_6$ |
+| $i$ | joint | $a_i$ [mm] | $\alpha_i$ | $d_i$ [mm] | $\theta_i$ |
+|:-:|:-:|:-:|:-:|:-:|:-:|
+| 1 | turret | 0 | $\pi/2$ | $d_1$ | $q_1$ |
+| 2 | shoulder | $a_2=300$ | 0 | 0 | $q_2$ |
+| 3 | elbow | $a_3=300$ | 0 | 0 | $q_3$ |
+| 4 | wrist pitch | 0 | $\pi/2$ | 0 | $q_4+\pi/2$ |
+| 5 | wrist roll | 0 | 0 | $d_5=142$ | $q_5$ |
 
-<sub>Denavit–Hartenberg parameters of the follower (master lengths scaled by κ)</sub>
+<sub>Denavit–Hartenberg parameters of the follower as built ($d_1$ = shoulder axis height; master lengths scaled by κ). The app and the Teensy measure joints from the idle pose found by homing instead.</sub>
 
 </div>
 
@@ -186,7 +185,7 @@ flowchart LR
   BAT["6S LiPo<br/>22.2 V · 111 Wh"]:::beige --> FUSE["main fuse"]
   FUSE --> ES["E-stop<br/>(latching)"]:::estop
   ES --> BUS["22.2 V actuator bus"] --> ACT["3× GIM8108-8<br/>GIM3505-8"]:::beige
-  ES --> SBUCK["buck 7.4 V / 6 V<br/>(high current)"] --> SRV["2× DS5180<br/>DS3218"]:::beige
+  ES --> SBUCK["buck 7.4 V / 6 V<br/>(high current)"] --> SRV["DS5180 turret<br/>DS3218 gripper"]:::beige
   FUSE --> LBUCK["buck 5 V"] --> LOGIC["Teensy 4.1<br/>TJA1051 · radio"]:::beige
 ```
 
@@ -235,12 +234,12 @@ Fixed-priority, rate-monotonic tasks. The control task runs in a hardware-timer 
 
 | Parameter | Value | Basis | | Parameter | Value | Basis |
 |---|---|:-:|---|---|---|:-:|
-| Degrees of freedom | 6 + gripper | design | | End-to-end latency | ≈ 13.9 ms | estimate |
+| Degrees of freedom | 5 + gripper | design | | End-to-end latency | ≈ 13.9 ms | estimate |
 | Master encoder resolution | 0.022° (14 bit) | design | | Link-loss detection | 50 ms | design |
 | Base servo resolution | 0.27° | design | | False watchdog trip ($p$ = 1 %) | 10⁻²⁰ | estimate |
 | Control / sampling rate | 200 Hz | design | | Recording memory | 72 kB/min | design |
 | Joint torque rated / stall | 7.5 / 22 N·m | datasheet | | Steady-state tracking error | ≤ 0.58° | estimate |
-| Payload at 0.55 m (static) | ≤ 1.4 kg | estimate | | Radio range (long-range mode) | 7 km | datasheet |
+| Payload at 0.74 m (static) | ≤ 1.0 kg | estimate | | Radio range (long-range mode) | 7 km | datasheet |
 | Battery energy | 111 Wh (≈ 1.1 h) | estimate | | Teensy CPU utilisation | ≈ 5.6 % | estimate |
 | Lag at 90°/s (raw / predicted) | 1.25° / 0.035° | estimate | | Phase-margin loss (in actuator) | ≈ 1.8° | estimate |
 
@@ -252,7 +251,7 @@ Fixed-priority, rate-monotonic tasks. The control task runs in a hardware-timer 
 **Forward kinematics**
 
 ```math
-\mathbf{T}_0^6(\mathbf q)=\prod_{i=1}^{6}\mathbf A_i(q_i)
+\mathbf{T}_0^5(\mathbf q)=\prod_{i=1}^{5}\mathbf A_i(q_i)
 ```
 
 **Task-space target with motion scaling**
@@ -504,7 +503,7 @@ On the right, the step buttons (±5°, ±15°) run a step test on the selected m
 
 **Future improvements**
 
-- [ ] CAN actuators on the base and wrist roll, removing the 0.27° resolution bottleneck and adding feedback on J1 and J6
+- [ ] A CAN actuator on the base turret, removing the 0.27° resolution bottleneck and adding feedback on J1
 - [ ] Haptic feedback on the master, rendering contact forces estimated from actuator currents (bilateral, passivity-based control)
 - [ ] Learning-based autonomy: train ACT or Diffusion Policy on the recorded demonstrations, with a camera on the follower
 - [ ] Quick-change end effectors (parallel gripper, vacuum) identified automatically by the controller

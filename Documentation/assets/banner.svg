@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="420" viewBox="0 0 1280 420" role="img" aria-labelledby="title">
-  <title id="title">TwinArm: teach-by-demonstration 6-DOF robotic arm with a passive wireless master</title>
+  <title id="title">TwinArm: teach-by-demonstration 5-DOF robotic arm with a passive wireless master</title>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0B0B0B"/>
@@ -27,7 +27,7 @@
     <text x="72" y="104" fill="#C8333A" font-size="15" font-weight="600" letter-spacing="4">LEADER–FOLLOWER · RECORD · REPLAY</text>
     <text x="66" y="200" font-size="104" font-weight="800" letter-spacing="4"><tspan fill="#F2E8D5">TWIN</tspan><tspan fill="#B3141B">ARM</tspan></text>
     <rect x="72" y="226" width="84" height="5" rx="2.5" fill="#B3141B"/>
-    <text x="72" y="276" fill="#F2E8D5" fill-opacity="0.92" font-size="27">Teach-by-demonstration 6-DOF robotic arm</text>
+    <text x="72" y="276" fill="#F2E8D5" fill-opacity="0.92" font-size="27">Teach-by-demonstration 5-DOF robotic arm</text>
     <text x="72" y="312" fill="#F2E8D5" fill-opacity="0.92" font-size="27">with a passive wireless master</text>
     <text x="72" y="372" fill="#F2E8D5" fill-opacity="0.55" font-size="13" letter-spacing="3">ROBOCHALLENGE 2026 · FREESTYLE SHOWCASE UNIVERSITY · TEAM BADGERLABS</text>
   </g>
