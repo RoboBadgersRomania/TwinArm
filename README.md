@@ -303,14 +303,20 @@ q_i(t)=q_{i,0}+\Delta q_i\left(10\tau^3-15\tau^4+6\tau^5\right),\qquad \tau=t/T
 TwinArm/
 ├── ArduinoCode/
 │   ├── main_components/
+│   │   ├── lightgateway/
+│   │   │   └── lightgateway.ino          WiFi ↔ UART bridge on the LightGateway 1.0 (ESP32-S3)
 │   │   └── slave_arm/
-│   │       ├── motorcontroller/          follower bench firmware (Teensy 4.1)
-│   │       │   ├── motorcontroller.ino     discovery, homing, serial jog console
+│   │       ├── motorcontroller/          follower firmware (Teensy 4.1)
+│   │       │   ├── motorcontroller.ino     discovery, homing, serial jog console, gateway link
 │   │       │   └── GDZ.h                   header-only SteadyWin GDZ CAN driver
 │   │       └── motorcontroller_old/      previous iteration
 │   └── unittests/
 │       └── servotest/
 │           └── servotest.ino             standalone gripper servo test
+├── InterfaceApp/                         pygame wireless interface
+│   ├── main.py                             the app
+│   ├── link.py · arm.py                    UDP link and side-view kinematics, each with a self-test
+│   └── sim.py                              fake gateway + arm for trying the app without hardware
 └── Documentation/
     ├── TwinArm___RoboChallenge.pdf       full technical report
     └── assets/                           README artwork
@@ -318,14 +324,14 @@ TwinArm/
 
 ### Follower bench firmware: `motorcontroller`
 
-On boot it runs the CAN decoder self-test, pings drivers **1–4** and prints firmware, voltage, temperature, gear ratio, torque constant and fault code for each one. It then opens and closes the gripper once, homes every joint to the **arm zero** (driver origin + `HOME_OFFSET`) and holds. Every 200 ms it prints each joint's angle relative to the arm zero, current, mode and fault code.
+On boot it runs the CAN decoder self-test, pings drivers **1–4** and prints firmware, voltage, temperature, gear ratio, torque constant and fault code for each one. It then opens and closes the gripper once, homes every joint to the **arm zero** (driver origin + `HOME_OFFSET`) and holds. Every 100 ms it prints each joint's angle relative to the arm zero, current, mode and fault code, and sends the same data to the LightGateway (see [Wireless interface](#wireless-interface-interfaceapp)).
 
 **You need**
 
 - a **Teensy 4.1** and the Arduino IDE with **Teensyduino**, which bundles `FlexCAN_T4` and `Servo`
 - a **TJA1051** transceiver: Teensy pin **22 → TXD**, pin **23 ← RXD**; CANH/CANL terminated with **120 Ω at both ends**
 - SteadyWin GDZ drivers on addresses **1–4**, CAN at **1 Mbit/s** (driver default, set in the ZE300 GUI)
-- the gripper servo signal on pin **6**, powered from its own supply, ground shared with the Teensy
+- the gripper servo signal on pin **6** and the turret servo (DS5180) on pin **9**, each powered from its own supply, ground shared with the Teensy
 
 **Flash it:** open `ArduinoCode/main_components/slave_arm/motorcontroller/motorcontroller.ino`, choose *Tools → Board → Teensy 4.1*, upload, then open the Serial Monitor with the *Newline* line ending.
 
@@ -342,7 +348,8 @@ On boot it runs the CAN decoder self-test, pings drivers **1–4** and prints fi
 | `<id> v<rpm>` | set max move speed | `1 v30` |
 | `<id> h` | home one joint | `1 h` |
 | `<id> o` | release one joint | `1 o` |
-| `<id> c` | clear fault and show the fault code left afterwards | `1 c` |
+| `<id> c` | clear fault and jam, show the fault code left afterwards | `1 c` |
+| `t <deg>` | turret angle, 0 = centre | `t -30` |
 
 **Calibration knobs** at the top of the sketch
 
@@ -352,6 +359,11 @@ On boot it runs the CAN decoder self-test, pings drivers **1–4** and prints fi
 | `HOME_RPM` | `10` | speed limit for the homing move (the driver forgets it at power-off) |
 | `CAN_BAUD` | `1000000` | must match the CAN baud set in the ZE300 GUI |
 | `GRIPPER_CLOSED_US` / `GRIPPER_OPEN_US` | `1350` / `2000` | hard limits: every gripper pulse is clamped to these |
+| `TURRET_SPAN_DEG` | `180` | degrees the turret turns between the 500 µs and 2500 µs pulses |
+| `TURRET_MIN_US` / `TURRET_MAX_US` | `500` / `2500` | hard limits for the turret pulse |
+| `JAM_ERR_DEG` / `JAM_MS` | `4` / `400` | jam detection: further than this from the target, moving less than a quarter of what the speed limit allows, for this long |
+
+**Jam detection.** Every telemetry sweep the Teensy checks each joint in position mode. A joint more than `JAM_ERR_DEG` from its target that moved less than a quarter of what its speed limit allows, for `JAM_MS`, is jammed: it holds where it stopped instead of pushing on, ignores `a`/`r` until `<id> c` or homing, and reports it in telemetry.
 
 > [!CAUTION]
 > The follower is a high-torque arm. Keep the E-stop within reach and clear of the workspace; `x` releases all motors from the console.
@@ -391,6 +403,68 @@ Settings are lost at power-off, except `setZeroHere`, which is saved in the driv
 
 Type a pulse width in microseconds (for example `1500`) in the Serial Monitor and the servo on pin 6 goes there. Nothing else runs: no CAN, no homing. Input is clamped to 500–2500 µs; the gripper may bind well inside that range, which is why the follower firmware limits it to 1350–2000 µs.
 
+### Wireless interface: `InterfaceApp`
+
+A pygame app that drives and watches the follower over **WiFi**, through a LightGateway 1.0 mounted on the robot. The LoRa link to the master arm comes later on the same board.
+
+```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontFamily": "Segoe UI, Helvetica, Arial, sans-serif", "primaryColor": "#0B0B0B", "primaryTextColor": "#F2E8D5", "primaryBorderColor": "#A4161A", "lineColor": "#A4161A", "textColor": "#F2E8D5", "edgeLabelBackground": "#1A1212"}}}%%
+flowchart LR
+  APP["InterfaceApp<br/>(pygame, PC)"] -- "WiFi · UDP 4210<br/>console lines" --> GW["LightGateway 1.0<br/>ESP32-S3"]
+  GW -- "UART 115200" --> T41["Teensy 4.1<br/>motorcontroller.ino"]
+  T41 -. "T lines, 10 Hz" .-> GW
+  GW -. "telemetry" .-> APP
+  T41 == CAN ==> ACT["4× GDZ drivers"]
+  T41 -- "PWM pin 9" --> TUR["turret DS5180"]
+```
+
+The gateway is a transparent bridge. Each datagram from the app holds ordinary console commands (`1 a12.50`, `t -30`, `x`) and goes to the Teensy unchanged. Each line the Teensy writes on its UART comes back as one datagram:
+
+```text
+T,id,ok,deg,target,amps,tempC,volts,busAmps,mode,fault,jammed   one per motor every 100 ms, angles relative to the arm zero
+#hello <ms>  →  G,<ms>,<uptime ms>,<rssi dBm>               app ↔ gateway heartbeat, gives round trip and WiFi signal
+```
+
+**Wiring**
+
+| LightGateway | Teensy 4.1 |
+|---|---|
+| TXD (IO18) | pin 7 (RX2) |
+| RXD (IO17) | pin 8 (TX2) |
+| GND | GND |
+
+Both boards run at 3.3 V, so the wires go straight across; connect only these three, each board keeps its own power. Pin 9 is the turret servo, and only the hardware UART pins can receive. Once a second the gateway's USB serial prints how many datagrams it passed to the Teensy and how many lines came back: 0 lines back means TXD/RXD swapped, GND missing, or the Teensy still homing.
+
+**Flash the gateway:** open `ArduinoCode/main_components/lightgateway/lightgateway.ino` with the Espressif *esp32* board package, board *ESP32S3 Dev Module*. By default it opens its own access point **TwinArm** (password in `AP_PASS`, change it) at `192.168.4.1:4210`; set `WIFI_SSID` / `WIFI_PASS` to join an existing network instead. The USB serial monitor prints the address at boot.
+
+**Run the app**
+
+```bash
+pip install -r InterfaceApp/requirements.txt
+```
+
+```bash
+python InterfaceApp/main.py
+```
+
+Join the TwinArm WiFi, open **Connection** (top left) and press *Connect*. With no hardware, run `python InterfaceApp/sim.py` in a second terminal and connect to `127.0.0.1`.
+
+| Control | Action |
+|---|---|
+| **CONTROL** button / `Space` | take control. The silhouette starts from the measured pose, so nothing jumps. When off, it idles and mirrors the telemetry |
+| drag the red tip | the arm follows. Inverse kinematics for shoulder, elbow and wrist pitch: the closed-form solution on the elbow branch you are on, inside the joint limits. If the target is out of reach or past a limit, damped least squares moves to the nearest pose it can reach, letting the tool angle give way first (shown in amber). The arm never goes below the table |
+| mouse wheel | tool (gripper) angle |
+| `A` / `D` | turret left / right (open-loop servo, shown in the top-view dial) |
+| `Q` / `E` | wrist roll |
+| **Speed** field, 1–100 % | type a value, then Enter or click away. Scales the joint speed (100 % = *Joint speed at 100 %* in Settings, 30 rpm by default) and the A/D and Q/E rates |
+| **Idle** / `I` | back to the pose homing found (every joint to 0 from the arm zero the Teensy stored) and the turret centred, without homing again |
+| `Esc` | control off; the arm holds its last target |
+| Home all · Clear faults · Release motors | console `h`, `<id> c`, `x` (release asks for a second click: the arm falls). Clear faults turns into a red **Clear jam** while a joint is jammed |
+
+Next to every joint the app shows its angle relative to the arm zero, target, temperature, driver power and current, mode and faults. On the right it graphs tracking error, phase current and temperature of every motor, one colour per joint. If telemetry stops for a second, Control switches off and the arm holds its pose. If the Teensy reports a jam, Control switches off too and will not come back on until the jam is cleared; the jammed joint pulses red in the drawing. In the simulator the elbow jams on a fake obstacle at +70°.
+
+**Settings** (top right, saved to `InterfaceApp/settings.json`) hold the calibration the drawing needs: link lengths (300 / 300 / 142 mm), the drawn angles of the idle pose at the arm zero, each motor's direction, joint and turret limits, speeds and graph window. The four CAN joints default to *Inverted*, which is how they turn on the real arm; check each joint with a small move before dragging far.
+
 <img src="Documentation/assets/divider.svg" width="100%" alt="">
 
 ## Roadmap
@@ -400,6 +474,7 @@ Type a pulse width in microseconds (for example `1500`) in the Serial Monitor an
 - [x] `GDZ.h` CAN driver with decoder self-test
 - [x] Follower bench firmware: discovery, homing to arm zero, serial jog console, live telemetry
 - [x] Gripper servo bench test
+- [x] WiFi interface: LightGateway bridge, pygame app with tip dragging, turret control, live telemetry and graphs
 
 **Designed in the report, next to build**
 
