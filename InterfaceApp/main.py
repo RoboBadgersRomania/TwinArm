@@ -3,6 +3,7 @@
 python main.py              connect from the Connection tab (gateway's own network: 192.168.4.1:4210)
 python main.py 127.0.0.1    connect straight away, e.g. to python sim.py running in another terminal
 """
+import csv
 import json
 import math
 import os
@@ -186,6 +187,8 @@ class App:
         self.gains_seen, self.jam_seen = {j[1]: 0.0 for j in JOINTS}, 0.0
         self.step_at, self.step_cid = 0.0, None  # when the last step test was asked for, and for which motor
         self.analysis = {}              # CAN id -> (capture time, metrics, hints) of its last step test
+        self.suite = None               # whole-arm test in progress: queue, current step, results
+        self.suite_results, self.suite_file = [], ""  # last finished whole-arm test
         self.restore_at = self.backup_armed = 0.0  # pending gateway restore; second click to overwrite a backup
         self.focus = self.panel = None
         self.tab = 0
@@ -450,6 +453,72 @@ class App:
             self.link.send(*self.speed_lines() + ["%d s%g" % (self.sel, deg)])
             self.step_at, self.step_cid = time.monotonic(), self.sel
 
+    def start_suite(self, deg=5):
+        """Step test every CAN joint, +deg then -deg so each ends where it started; results go to a CSV."""
+        if self.suite:
+            self.suite = None
+            self.toast("Whole-arm test stopped")
+            return
+        if self.control or self.jams or not self.link.robot_online():
+            self.toast("Whole-arm test needs the arm online, Control off and no jam")
+            return
+        self.suite = {"queue": [(j[1], s * deg) for j in JOINTS for s in (1, -1)], "now": None, "results": [],
+                      "total": 2 * len(JOINTS)}
+        self.suite_next()
+
+    def suite_next(self):
+        s = self.suite
+        if not s["queue"]:
+            self.suite = None
+            self.suite_results = s["results"]
+            self.save_suite(s["results"])
+            return
+        cid, deg = s["queue"].pop(0)
+        self.sel = cid
+        self.step(deg)
+        s["now"] = (cid, deg, time.monotonic())
+
+    def suite_tick(self):
+        cid, deg, at = self.suite["now"]
+        got = self.capture(cid)
+        if got and got[0]["at"] >= at:
+            cap, met, hs = got
+        elif time.monotonic() - at > 6:
+            cap, met, hs = None, None, [("No step data came back", {})]
+        else:
+            return
+        m = self.link.motors[cid]
+        self.suite["results"].append({
+            "motor": next(j[0] for j in JOINTS if j[1] == cid), "id": cid, "step": deg, "metrics": met,
+            "gains": m.gains if m.gains_ok else None, "verdict": hs[0][0], "curve": cap["y"] if cap else [],
+            "dt": cap["dt"] if cap else 0})
+        self.suite_next()
+
+    def save_suite(self, results):
+        """steptest_<time>.csv: one row per step; _curves.csv: every sample."""
+        folder = os.path.join(HERE, "step_tests")
+        os.makedirs(folder, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(folder, "steptest_%s.csv" % stamp)
+        fmt = lambda v, f="%.3f": "" if v is None else f % v
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["motor", "id", "step_deg", "overshoot_pct", "rise_s", "settle_s", "steady_error_deg",
+                        "peak_speed_dps", "speed_limit_dps", "pos_kp", "pos_ki", "vel_kp", "vel_ki", "verdict"])
+            for r in results:
+                m, g = r["metrics"] or {}, r["gains"] or (None,) * 4
+                w.writerow([r["motor"], r["id"], r["step"], fmt(m.get("overshoot") and 100 * m["overshoot"], "%.1f"),
+                            fmt(m.get("rise")), fmt(m.get("settle")), fmt(m.get("sse")), fmt(m.get("speed"), "%.1f"),
+                            fmt(m.get("limit"), "%.1f")] + [fmt(v, "%g") for v in g] + [r["verdict"]])
+        with open(path.replace(".csv", "_curves.csv"), "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["motor", "id", "step_deg", "t_s", "deg"])
+            for r in results:
+                for i, y in enumerate(r["curve"]):
+                    w.writerow([r["motor"], r["id"], r["step"], "%.2f" % (i * r["dt"]), "%.3f" % y])
+        self.suite_file = path
+        self.toast("Whole-arm test saved: step_tests/%s" % os.path.basename(path))
+
     def capture(self, cid):
         """(capture, metrics, hints) of the motor's last finished step test, or None."""
         cap = self.link.captures.get(cid)
@@ -615,6 +684,8 @@ class App:
             if ms:  # 0 only means off: keep the time to switch back on with
                 self.fields["jam_ms"] = str(ms)
             self.cfg["jam_on"] = int(ms > 0)
+        if self.suite and self.suite["now"]:
+            self.suite_tick()
         if self.step_at and time.monotonic() - self.step_at > 4.5:  # the capture takes 2 s plus sending
             cap = self.link.captures.get(self.step_cid)
             if cap and cap["at"] >= self.step_at and cap["fail"]:
@@ -921,6 +992,41 @@ class App:
         now = ("Teensy now: %g° for %d ms" % jc if jc[1] else "Teensy now: off") if jc else "Teensy: not read yet"
         text(surf, now, (r.x + 546, y + 16), 12, MUTED, anchor="midleft")
 
+        y += 52  # whole-arm step test: progress, then the last results
+        pygame.draw.line(surf, LINE, (r.x + 18, y - 10), (r.right - 18, y - 10))
+        if self.suite:
+            cid, deg, _ = self.suite["now"]
+            done = len(self.suite["results"]) + 1
+            text(surf, "Whole-arm test: motor #%d %+g° (%d of %d)…" % (cid, deg, done, self.suite["total"]),
+                 (r.x + 18, y + 4), 14, AMBER, True)
+            return
+        text(surf, "Whole-arm test", (r.x + 18, y), 15, BEIGE, True)
+        if not self.suite_results:
+            text(surf, "Whole arm (right panel) steps every joint +5° and back, Control off, and saves a CSV.",
+                 (r.x + 18, y + 22), 12, MUTED)
+            return
+        text(surf, "Saved to step_tests/%s" % os.path.basename(self.suite_file), (r.right - 18, y + 3), 11, MUTED,
+             anchor="topright")
+        cols = (("motor", 18), ("step", 130), ("overshoot", 180), ("rise", 260), ("settles", 320), ("off by", 390),
+                ("peak / limit", 455), ("verdict", 575))
+        for name, x in cols:
+            text(surf, name, (r.x + x, y + 24), 11, MUTED, True)
+        for i, res in enumerate(self.suite_results):
+            ry = y + 42 + i * 17
+            if ry > r.bottom - 18:
+                break
+            m = res["metrics"]
+            num = lambda k, f: (f % m[k]) if m and m.get(k) is not None else "–"
+            cells = [res["motor"], "%+g°" % res["step"], "%.0f %%" % (100 * m["overshoot"]) if m else "–",
+                     num("rise", "%.2f s"), num("settle", "%.2f s"), num("sse", "%.2f°"),
+                     "%.0f / %.0f°/s" % (m["speed"], m["limit"]) if m and m.get("limit") else "–"]
+            for (_, x), c in zip(cols, cells):
+                text(surf, c, (r.x + x, ry), 12, BEIGE)
+            verdict = res["verdict"]
+            while verdict and font(12).size(verdict)[0] > r.right - 18 - (r.x + 575):
+                verdict = verdict[:-2]
+            text(surf, verdict if verdict == res["verdict"] else verdict + "…", (r.x + 575, ry), 12, MUTED)
+
     def draw_step(self, surf, r):
         name, cid, col = next(j for j in JOINTS if j[1] == self.sel)
         m = self.link.motors[cid]
@@ -929,10 +1035,12 @@ class App:
         text(surf, "%s  #%d" % (name, cid), (r.right - 18, r.y + 16), 13, col, True, "topright")
         text(surf, "Steps the joint from where it is, Control off. The Teensy records", (r.x + 18, r.y + 38), 12, MUTED)
         text(surf, "it every 10 ms for 2 s; the app reads the curve and suggests gains.", (r.x + 18, r.y + 54), 12, MUTED)
-        bw = (r.w - 36 - 30) // 4
+        bw = (r.w - 36 - 40 - 110) // 4
         for k, deg in enumerate((-15, -5, 5, 15)):
             self.button(surf, pygame.Rect(r.x + 18 + k * (bw + 10), r.y + 80, bw, 36), "%+d°" % deg,
                         lambda deg=deg: self.step(deg))
+        self.button(surf, pygame.Rect(r.right - 18 - 110, r.y + 80, 110, 36), "Stop" if self.suite else "Whole arm",
+                    self.start_suite, "danger" if self.suite else "on", 12)
         g = pygame.Rect(r.x + 8, r.y + 126, r.w - 16, max(160, r.h - 126 - 196))
         got = self.capture(cid)
         waiting = time.monotonic() - self.step_at < 4 and (not got or got[0]["at"] < self.step_at)
