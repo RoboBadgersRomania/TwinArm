@@ -4,7 +4,12 @@ python sim.py, then python main.py 127.0.0.1. Speaks the same lines as the real 
 follows the console commands and sends T lines at 10 Hz. Each joint is a toy spring-damper driven by its
 position Kp and velocity Kp (g command), capped at its rpm, so step tests react to tuning.
 The elbow (#2) hits a fake obstacle at +70 deg and jams, with the same rule as checkJam on the Teensy.
+
+python sim.py --model step_tests/model_fit.json   joints move like the real ones fitted by compare.py / the app's
+whole-arm test, starting with the gains they were measured with; changing gains scales the fit like a cascaded
+P (position) -> P (velocity) loop: kp ~ pos Kp * vel Kp, kv ~ vel Kp. An approximation, good for trying directions.
 """
+import json
 import math
 import random
 import socket
@@ -21,6 +26,16 @@ jam_cfg = [4.0, 400]  # tolerance deg, time ms (0 = off)
 backup = {}           # the gateway's flash gain backup: id -> 4 gains
 SIM_DROP_END = "--drop-end" in sys.argv  # lose every step test's end line, as a lossy WiFi might
 HIDDEN_CAP = {4: 15.0} if "--slow-roll" in sys.argv else {}  # deg/s the driver itself allows, whatever 'v' says
+MODEL = {}  # CAN id -> fitted real joint: kp, kv, vmax and the gains / speed limit it was measured with
+if "--model" in sys.argv:
+    with open(sys.argv[sys.argv.index("--model") + 1]) as f:
+        MODEL = {int(k): v for k, v in json.load(f).items()}
+    for i, fit in MODEL.items():
+        if fit.get("gains"):
+            motors[i]["gains"] = list(fit["gains"])  # Read in the app shows what the real driver had
+        print("motor %d moves like the fitted %s: wn %.1f rad/s, zeta %.2f, top %s"
+              % (i, fit["motor"], fit["wn"], fit["zeta"], "%.0f deg/s" % fit["vmax"] if fit["vmax"] else "its speed limit"),
+              flush=True)
 pc, last, next_tx = None, time.monotonic(), 0.0
 print("fake gateway on 127.0.0.1:4210, run: python main.py 127.0.0.1")
 
@@ -30,6 +45,14 @@ def move(i, m, dt):
     if m["mode"]:
         kp, _, kv, _ = m["gains"]
         vmax = min(m["rpm"] * 6, HIDDEN_CAP.get(i, 1e9))  # rpm -> deg/s
+        fit = MODEL.get(i)
+        if fit:  # the fitted real joint, scaled by how far the gains and speed moved since the test
+            g0 = fit.get("gains") or m["gains"]
+            pk = m["gains"][0] * m["gains"][2] / (g0[0] * g0[2]) if g0[0] * g0[2] else 1.0
+            vk = m["gains"][2] / g0[2] if g0[2] else 1.0
+            kp, kv = fit["kp"] * pk, fit["kv"] * vk
+            if fit["vmax"]:  # a cap the real joint hit; None = it never did, keep the commanded limit
+                vmax = fit["vmax"] * (m["rpm"] * 6 / fit["limit_dps"] if fit.get("limit_dps") else 1.0)
         m["vel"] = max(-vmax, min(vmax, m["vel"] + (kp * (m["target"] - m["deg"]) - kv * m["vel"]) * dt))
         m["deg"] += m["vel"] * dt
         if m["deg"] >= OBSTACLE.get(i, 1e9):
@@ -77,10 +100,10 @@ def command(line):
             m["target"] = start + v
             send = lambda s: sock.sendto((s + "\n").encode(), pc)
             ys = []
-            for n in range(200):
+            for n in range(200):  # sample, then move 10 ms: the first sample is the moment of the step, as on the Teensy
+                ys.append(m["deg"] + random.gauss(0, 0.01))
                 for _ in range(10):
                     move(int(i), m, 0.001)
-                ys.append(m["deg"] + random.gauss(0, 0.01))
             send("S,%s,begin,%.3f,%.3f,10" % (i, start, m["target"]))
             for n in range(0, 200, 10):  # 10 samples a line, like the Teensy
                 send("S,%s,%d,%s" % (i, n, ",".join("%.2f" % y for y in ys[n:n + 10])))

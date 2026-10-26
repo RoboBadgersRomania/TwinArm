@@ -74,6 +74,9 @@ def hints(m):
         out.insert(0, ("Looks well tuned: %.0f %% overshoot, settles in %.2f s" % (100 * os_, m["settle"]), {}))
     if m["limited"] and rise is not None:
         out.append(("The rise is set by the speed limit (Speed %), not by the gains", {}))
+    if not out:  # always say something: the app shows hints[0]
+        out.append(("Did not settle within the 2 s capture: more damping (Velocity Kp) or a smaller step"
+                    if m["settle"] is None else "No clear problem found", {}))
     return out
 
 
@@ -106,6 +109,8 @@ if __name__ == "__main__":
     m = metrics(second_order(0.8, 15), 0.01, 0, 10, rpm=10)                         # 60 deg/s cap: rise is speed-bound
     assert m["limited"] and "speed limit" in hints(m)[-1][0]
     assert metrics([0.0] * 5, 0.01, 0, 10) is None and hints(None)[0][1] == {}
+    for zeta, wn in ((0.25, 1.0), (0.1, 2.0), (1.0, 0.5)):  # far too slow to settle in 2 s: still a verdict
+        assert hints(metrics(second_order(zeta, wn), 0.01, 0, 10, rpm=6)), (zeta, wn)
     slow = [min(10.0, 7.0 * i * 0.01) for i in range(200)]                           # straight 7 deg/s ramp, limit 54
     m = metrics(slow, 0.01, 0, 10, rpm=9)
     assert abs(m["speed"] - 7) < 0.1 and "something else caps" in hints(m)[0][0] and not any(c for _, c in hints(m)), hints(m)

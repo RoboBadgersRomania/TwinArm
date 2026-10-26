@@ -12,6 +12,7 @@ import time
 
 import pygame
 
+import compare
 import tune
 from arm import fk, ik, wrap
 from link import MODES, Link
@@ -491,7 +492,9 @@ class App:
         self.suite["results"].append({
             "motor": next(j[0] for j in JOINTS if j[1] == cid), "id": cid, "step": deg, "metrics": met,
             "gains": m.gains if m.gains_ok else None, "verdict": hs[0][0], "curve": cap["y"] if cap else [],
-            "dt": cap["dt"] if cap else 0})
+            "dt": cap["dt"] if cap else 0, "start": cap["start"] if cap else None,
+            "target": cap["target"] if cap else None,
+            "fit": compare.fit(cap["y"], cap["start"], cap["target"]) if cap else None})  # ~0.3 s: wn, zeta, vmax, rms
         self.suite_next()
 
     def save_suite(self, results):
@@ -503,21 +506,38 @@ class App:
         fmt = lambda v, f="%.3f": "" if v is None else f % v
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["motor", "id", "step_deg", "overshoot_pct", "rise_s", "settle_s", "steady_error_deg",
-                        "peak_speed_dps", "speed_limit_dps", "pos_kp", "pos_ki", "vel_kp", "vel_ki", "verdict"])
+            w.writerow(["motor", "id", "step_deg", "start_deg", "target_deg", "speed_pct", "overshoot_pct", "rise_s",
+                        "settle_s", "steady_error_deg", "peak_speed_dps", "speed_limit_dps", "pos_kp", "pos_ki", "vel_kp",
+                        "vel_ki", "fit_wn", "fit_zeta", "fit_vmax_dps", "fit_rms_deg", "verdict"])
             for r in results:
-                m, g = r["metrics"] or {}, r["gains"] or (None,) * 4
-                w.writerow([r["motor"], r["id"], r["step"], fmt(m.get("overshoot") and 100 * m["overshoot"], "%.1f"),
+                m, g, fi = r["metrics"] or {}, r["gains"] or (None,) * 4, r["fit"] or (None,) * 4
+                w.writerow([r["motor"], r["id"], r["step"], fmt(r["start"]), fmt(r["target"]), self.cfg["speed"],
+                            fmt(100 * m["overshoot"], "%.1f") if m else "",
                             fmt(m.get("rise")), fmt(m.get("settle")), fmt(m.get("sse")), fmt(m.get("speed"), "%.1f"),
-                            fmt(m.get("limit"), "%.1f")] + [fmt(v, "%g") for v in g] + [r["verdict"]])
+                            fmt(m.get("limit"), "%.1f")] + [fmt(v, "%g") for v in g] +
+                           [fmt(fi[0], "%.2f"), fmt(fi[1]), fmt(fi[2], "%.1f"), fmt(fi[3])] + [r["verdict"]])
         with open(path.replace(".csv", "_curves.csv"), "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["motor", "id", "step_deg", "t_s", "deg"])
             for r in results:
                 for i, y in enumerate(r["curve"]):
                     w.writerow([r["motor"], r["id"], r["step"], "%.2f" % (i * r["dt"]), "%.3f" % y])
+        rows = {r["id"]: {"motor": r["motor"], "speed_limit_dps": (r["metrics"] or {}).get("limit"),
+                          **dict(zip(("pos_kp", "pos_ki", "vel_kp", "vel_ki"), r["gains"] or ()))} for r in results}
+        fits = {}
+        for r in results:
+            fits.setdefault(str(r["id"]), []).append((rows[r["id"]], r["fit"]))
+        for name in ("steptest_%s_model.json" % stamp, "model_fit.json"):  # model_fit.json = the latest, for sim.py
+            compare.save_model(fits, None, os.path.join(folder, name))
         self.suite_file = path
         self.toast("Whole-arm test saved: step_tests/%s" % os.path.basename(path))
+
+    def open_tests(self):
+        folder = os.path.join(HERE, "step_tests")
+        os.makedirs(folder, exist_ok=True)
+        if hasattr(os, "startfile"):  # Windows Explorer; elsewhere the path is in the toast
+            os.startfile(folder)
+        self.toast(folder)
 
     def capture(self, cid):
         """(capture, metrics, hints) of the motor's last finished step test, or None."""
@@ -994,21 +1014,27 @@ class App:
 
         y += 52  # whole-arm step test: progress, then the last results
         pygame.draw.line(surf, LINE, (r.x + 18, y - 10), (r.right - 18, y - 10))
+        text(surf, "Whole-arm test", (r.x + 18, y), 15, BEIGE, True)
+        self.button(surf, pygame.Rect(r.right - 18 - 120 - 10 - 190, y - 4, 190, 30),
+                    "Stop the test" if self.suite else "Run whole-arm test", self.start_suite,
+                    "danger" if self.suite else "on", 13, True)
+        self.button(surf, pygame.Rect(r.right - 18 - 120, y - 4, 120, 30), "Open folder", self.open_tests, size=12)
         if self.suite:
             cid, deg, _ = self.suite["now"]
             done = len(self.suite["results"]) + 1
-            text(surf, "Whole-arm test: motor #%d %+g° (%d of %d)…" % (cid, deg, done, self.suite["total"]),
-                 (r.x + 18, y + 4), 14, AMBER, True)
+            text(surf, "Testing motor #%d %+g° (%d of %d)…" % (cid, deg, done, self.suite["total"]),
+                 (r.x + 18, y + 34), 14, AMBER, True)
             return
-        text(surf, "Whole-arm test", (r.x + 18, y), 15, BEIGE, True)
         if not self.suite_results:
-            text(surf, "Whole arm (right panel) steps every joint +5° and back, Control off, and saves a CSV.",
-                 (r.x + 18, y + 22), 12, MUTED)
+            text(surf, "Steps every joint +5° and back (Control off, about 20 s), then saves the results, the curves",
+                 (r.x + 18, y + 34), 12, MUTED)
+            text(surf, "and a fitted model of each joint to InterfaceApp/step_tests/ (open with compare.py, sim.py --model).",
+                 (r.x + 18, y + 50), 12, MUTED)
             return
-        text(surf, "Saved to step_tests/%s" % os.path.basename(self.suite_file), (r.right - 18, y + 3), 11, MUTED,
-             anchor="topright")
-        cols = (("motor", 18), ("step", 130), ("overshoot", 180), ("rise", 260), ("settles", 320), ("off by", 390),
-                ("peak / limit", 455), ("verdict", 575))
+        text(surf, "Saved to step_tests/%s" % os.path.basename(self.suite_file), (r.x + 18, y + 24), 11, MUTED)
+        y += 14
+        cols = (("motor", 18), ("step", 120), ("overshoot", 165), ("rise", 240), ("settles", 295), ("off by", 360),
+                ("peak / limit", 420), ("model ωn · ζ", 530), ("verdict", 635))
         for name, x in cols:
             text(surf, name, (r.x + x, y + 24), 11, MUTED, True)
         for i, res in enumerate(self.suite_results):
@@ -1019,13 +1045,14 @@ class App:
             num = lambda k, f: (f % m[k]) if m and m.get(k) is not None else "–"
             cells = [res["motor"], "%+g°" % res["step"], "%.0f %%" % (100 * m["overshoot"]) if m else "–",
                      num("rise", "%.2f s"), num("settle", "%.2f s"), num("sse", "%.2f°"),
-                     "%.0f / %.0f°/s" % (m["speed"], m["limit"]) if m and m.get("limit") else "–"]
+                     "%.0f / %.0f°/s" % (m["speed"], m["limit"]) if m and m.get("limit") else "–",
+                     "%.1f · %.2f" % res["fit"][:2] if res["fit"] else "–"]
             for (_, x), c in zip(cols, cells):
                 text(surf, c, (r.x + x, ry), 12, BEIGE)
             verdict = res["verdict"]
-            while verdict and font(12).size(verdict)[0] > r.right - 18 - (r.x + 575):
+            while verdict and font(12).size(verdict)[0] > r.right - 18 - (r.x + 635):
                 verdict = verdict[:-2]
-            text(surf, verdict if verdict == res["verdict"] else verdict + "…", (r.x + 575, ry), 12, MUTED)
+            text(surf, verdict if verdict == res["verdict"] else verdict + "…", (r.x + 635, ry), 12, MUTED)
 
     def draw_step(self, surf, r):
         name, cid, col = next(j for j in JOINTS if j[1] == self.sel)
