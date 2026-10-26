@@ -11,6 +11,7 @@ import time
 
 import pygame
 
+import tune
 from arm import fk, ik, wrap
 from link import MODES, Link
 
@@ -30,17 +31,24 @@ JOINTS = [  # name, CAN driver id, graph colour; the first three are the side-vi
     ("Wrist roll", 4, (120, 150, 245)),
 ]
 TOP, SIDE, BAR = 60, 92, 64  # top bar height, sidebar width, control bar height
+GRIP_IDLE = 23  # "p" value where the Teensy parks the gripper: GRIPPER_MID_US 1500 on its 1350..2000 us scale
 
 DEFAULTS = {
     "host": "192.168.4.1", "port": 4210,
     "L1": 300, "L2": 300, "L3": 142,            # mm: shoulder-elbow, elbow-wrist, wrist-tip
     "zero1": 80, "zero2": -132, "zero3": 52,    # joint angles as drawn at the arm zero (the idle pose photo)
     "sign1": -1, "sign2": 1, "sign3": -1, "sign4": -1, "sign_t": 1,  # motor direction against the drawing (checked on the arm)
+    "sign_g": -1,                               # gripper: on the real one the 1350 us end opens it, so "p" runs reversed
     "table": 110,                               # mm from the shoulder axis down to the table: tip never goes below
     "limit": 150, "turret_limit": 90,           # +- degrees from the arm zero
-    "turret_rate": 60, "roll_rate": 90,         # deg/s at 100 % while A/D or Q/E is held
+    "turret_rate": 60,                          # deg/s at 100 % while A/D is held (W/S runs at the joint speed)
+    "grip_rate": 50,                            # % of the gripper stroke per s while Space/Ctrl is held (not scaled)
     "rpm_max": 30,                              # joint move speed at 100 %, sent with Control ON (drivers forget it at power-off)
-    "speed": 30,                                # %, the Speed field: scales joints, turret and roll
+    "roll_dps": 60,                             # deg/s the wrist roll motor spins at (its driver's limit, Q/E drive it)
+    "roll_units": 8,                            # roll driver rpm per output rpm: it counts motor rpm, before the 8:1 gear
+    "speed": 30,                                # %, the Speed field: scales the joints and the turret
+    "jam_err": 4, "jam_ms": 400, "jam_on": 1,   # jam detection on the Teensy: tolerance deg, time ms, switch
+    "tuning": {},                               # "<CAN id>": [pos kp, pos ki, vel kp, vel ki, max amps] as typed
     "window": 20,                               # graph history, s
     "mirror": 0,                                # 1 = arm faces left, as in the photo
 }
@@ -52,19 +60,23 @@ ROWS = [  # label, key[, step, min, max]; no step = toggle, key None = section t
     ("Wrist at arm zero (°)", "zero3", 1, -180, 180),
     ("Motor direction", None),
     ("Shoulder", "sign1"), ("Elbow", "sign2"), ("Wrist pitch", "sign3"), ("Wrist roll", "sign4"), ("Turret", "sign_t"),
+    ("Gripper", "sign_g"),
     ("Motion", None),
     ("Joint limit (± ° from zero)", "limit", 5, 10, 180), ("Turret limit (± °)", "turret_limit", 5, 10, 135),
     ("Turret speed at 100 %, A / D (°/s)", "turret_rate", 5, 5, 180),
-    ("Wrist roll speed at 100 %, Q / E (°/s)", "roll_rate", 5, 5, 360),
+    ("Gripper speed, Space / Ctrl (%/s)", "grip_rate", 5, 5, 200),
     ("Joint speed at 100 % (rpm)", "rpm_max", 1, 1, 60),
+    ("Wrist roll motor speed (°/s)", "roll_dps", 5, 5, 360),
+    ("Roll driver rpm per output rpm", "roll_units", 1, 1, 50),
     ("Display", None),
     ("Graph window (s)", "window", 5, 5, 120), ("Mirror view (arm faces left)", "mirror"),
 ]
-CALIBRATION = {"zero1", "zero2", "zero3", "sign1", "sign2", "sign3", "sign4", "sign_t"}
+GAIN_NAMES = ("Position Kp", "Position Ki", "Velocity Kp", "Velocity Ki")  # tune.py's gain index order
+CALIBRATION = {"zero1", "zero2", "zero3", "sign1", "sign2", "sign3", "sign4", "sign_t", "sign_g"}
 
 
 def load():
-    cfg = dict(DEFAULTS)
+    cfg = dict(DEFAULTS, tuning={})
     try:
         with open(SETTINGS_FILE) as f:
             cfg.update(json.load(f))
@@ -97,6 +109,19 @@ def text(surf, s, pos, size=14, color=BEIGE, bold=False, anchor="topleft"):
     return r
 
 
+def wrap_text(s, size, width):
+    """Lines of s that fit width pixels at this font size."""
+    lines, cur = [], ""
+    for word in s.split(" "):
+        test = (cur + " " + word).strip()
+        if cur and font(size).size(test)[0] > width:
+            lines.append(cur)
+            cur = word
+        else:
+            cur = test
+    return lines + [cur]
+
+
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
@@ -125,6 +150,13 @@ def icon_remote(s, c, col):
         pygame.draw.arc(s, col, (x - r, y - 9 - r, 2 * r, 2 * r), math.radians(45), math.radians(135), 2)
 
 
+def icon_tune(s, c, col):
+    x, y = c
+    for dx, ky in ((-7, 4), (0, -5), (7, 1)):  # three sliders
+        pygame.draw.line(s, col, (x + dx, y - 11), (x + dx, y + 11), 2)
+        pygame.draw.circle(s, col, (x + dx, y + ky), 3.5)
+
+
 def icon_replay(s, c, col):
     x, y = c
     pygame.draw.arc(s, col, (x - 11, y - 11, 22, 22), math.radians(60), math.radians(360), 2)
@@ -145,13 +177,23 @@ class App:
     def __init__(self, host=None):
         self.cfg = load()
         self.link = Link([j[1] for j in JOINTS])
-        self.fields = {"host": host or self.cfg["host"], "port": str(self.cfg["port"]), "speed": str(self.cfg["speed"])}
+        self.fields = {"host": host or self.cfg["host"], "port": str(self.cfg["port"]), "speed": str(self.cfg["speed"]),
+                       "jam_err": "%g" % self.cfg["jam_err"], "jam_ms": str(self.cfg["jam_ms"])}
+        for _, cid, _ in JOINTS:  # Configuration tab: last values typed, until the drivers are read
+            for k, v in enumerate(self.cfg["tuning"].get(str(cid), [""] * 5)):
+                self.fields["t%d_%d" % (cid, k)] = v
+        self.sel = JOINTS[0][1]         # motor on the step-test graph
+        self.gains_seen, self.jam_seen = {j[1]: 0.0 for j in JOINTS}, 0.0
+        self.step_at, self.step_cid = 0.0, None  # when the last step test was asked for, and for which motor
+        self.analysis = {}              # CAN id -> (capture time, metrics, hints) of its last step test
+        self.restore_at = self.backup_armed = 0.0  # pending gateway restore; second click to overwrite a backup
         self.focus = self.panel = None
         self.tab = 0
         self.connected = self.control = self.drag = False
         self.g = self.zero()            # commanded joint angles as drawn
         self.tool = sum(self.g)         # tool angle kept while dragging, wheel changes it
         self.roll = self.turret = 0.0   # commanded, in the drawing's direction
+        self.grip = self.grip_from(GRIP_IDLE)  # commanded gripper opening, % open; open loop like the turret
         self.drag_mm = None
         self.ik_exact = True            # False while the drag target is out of reach or past a limit
         self.jams = set()               # CAN ids the Teensy reports jammed
@@ -177,6 +219,10 @@ class App:
 
     def motor(self, i, drawn_deg):
         return self.cfg["sign%d" % (i + 1)] * wrap(drawn_deg - self.zero()[i])
+
+    def grip_from(self, p):
+        """% open for a Teensy "p" value, and back: the same mapping both ways."""
+        return p if self.cfg["sign_g"] > 0 else 100 - p
 
     def measured(self):
         if not self.link.robot_online():
@@ -232,16 +278,29 @@ class App:
             tl = self.cfg["turret_limit"]
             pct = self.cfg["speed"] / 100
             self.turret = clamp(self.turret + (k[pygame.K_a] - k[pygame.K_d]) * self.cfg["turret_rate"] * pct * dt, -tl, tl)
-            self.roll = clamp(self.roll + (k[pygame.K_e] - k[pygame.K_q]) * self.cfg["roll_rate"] * pct * dt,
-                              -self.cfg["limit"], self.cfg["limit"])
+            # deg/s = the speed limit each driver got, so the target never runs ahead of the motor
+            turn = k[pygame.K_q] - k[pygame.K_e]  # Q left, E right, like A/D
+            if turn:  # the target leads the real roll by 15 deg at most, so it stops soon after the key is let go
+                real = self.cfg["sign4"] * self.link.motors[JOINTS[3][1]].deg
+                self.roll = clamp(clamp(self.roll + turn * self.cfg["roll_dps"] * dt, real - 15, real + 15),
+                                  -self.cfg["limit"], self.cfg["limit"])
+            step = (k[pygame.K_w] - k[pygame.K_s]) * self.rpm(JOINTS[2][1]) * 6 * dt  # W tilts the tool up
+            if step:
+                z, lim = self.zero()[2], self.cfg["limit"]
+                g = [self.g[0], self.g[1], z + clamp(self.g[2] + step - z, -lim, lim)]
+                if min(p[1] for p in fk(g, self.lengths())[1:]) >= 15 - self.cfg["table"]:  # not into the table
+                    self.g, self.tool = g, sum(g)  # a drag afterwards keeps this wrist angle
+            ctrl = k[pygame.K_LCTRL] or k[pygame.K_RCTRL]
+            self.grip = clamp(self.grip + (ctrl - k[pygame.K_SPACE]) * self.cfg["grip_rate"] * dt, 0, 100)
         targets = {JOINTS[i][1]: self.motor(i, self.g[i]) for i in range(3)}
         targets[JOINTS[3][1]] = self.cfg["sign4"] * self.roll
         targets["t"] = self.cfg["sign_t"] * self.turret
+        targets["p"] = self.grip_from(self.grip)
         full = time.monotonic() - self.full_at > 0.5  # resend everything twice a second in case a datagram got lost
         lines = []
         for key, v in targets.items():
             if full or abs(v - self.sent.get(key, 1e9)) > 0.05:
-                lines.append("t %.1f" % v if key == "t" else "%d a%.2f" % (key, v))
+                lines.append("t %.1f" % v if key == "t" else "p %.1f" % v if key == "p" else "%d a%.2f" % (key, v))
                 self.sent[key] = v
         if full:
             self.full_at = time.monotonic()
@@ -270,8 +329,14 @@ class App:
 
     def speed_lines(self):
         """Joint speed for every driver: Speed % of the 100 % rpm."""
-        rpm = max(0.1, self.cfg["rpm_max"] * self.cfg["speed"] / 100)
-        return ["%d v%.2f" % (j[1], rpm) for j in JOINTS]
+        return ["%d v%.2f" % (j[1], self.rpm(j[1])) for j in JOINTS]
+
+    def rpm(self, cid):
+        """Speed limit for one driver: Speed % of the 100 % rpm. The wrist roll gets its own speed instead,
+        in the motor rpm its driver counts (deg/s / 6 = output rpm, times the gear)."""
+        if cid == JOINTS[3][1]:
+            return max(0.1, self.cfg["roll_dps"] / 6 * self.cfg["roll_units"])
+        return max(0.1, self.cfg["rpm_max"] * self.cfg["speed"] / 100)
 
     def apply_speed(self):
         s = self.fields["speed"].strip()
@@ -284,16 +349,149 @@ class App:
     def home(self):
         self.set_control(False, "Homing all joints: telemetry pauses until it is done")
         self.link.send("h", *self.speed_lines())  # homing sets its own speed; these run once it is done
+        self.grip = self.grip_from(GRIP_IDLE)  # homing cycles the gripper and parks it there
 
     def idle(self):
         """Back to the pose homing found: 0 is the arm zero the Teensy stored, so no re-homing."""
         self.turret = self.roll = 0.0
+        self.grip = self.grip_from(GRIP_IDLE)
         if self.control:  # move the commanded pose, the control loop sends it
             self.g, self.drag = self.zero(), False
             self.tool = sum(self.g)
         else:
-            self.link.send(*self.speed_lines() + ["%d a0" % j[1] for j in JOINTS] + ["t 0"])
+            self.link.send(*self.speed_lines() + ["%d a0" % j[1] for j in JOINTS] + ["t 0", "p %d" % GRIP_IDLE])
         self.toast("Going to the idle pose found by homing")
+
+    def read_tuning(self):
+        self.link.send(*["%d g" % j[1] for j in JOINTS] + ["j", "#load"])  # #load: is there a gateway backup?
+        self.toast("Reading gains from every driver")
+
+    def backup_gains(self):
+        """What the drivers hold right now goes to the gateway's flash, to come back to after experimenting."""
+        missing = [j[1] for j in JOINTS if not self.link.motors[j[1]].gains_ok]
+        if missing:
+            self.read_tuning()
+            self.toast("Reading the drivers first (#%s): press Back up again" % ", #".join(map(str, missing)))
+            return
+        if self.link.backup and time.monotonic() - self.backup_armed > 2:
+            self.backup_armed = time.monotonic()
+            self.toast("The gateway already holds a backup: click again within 2 s to overwrite it")
+            return
+        self.backup_armed = 0.0
+        self.link.send(*["#save %d %s" % (j[1], " ".join("%g" % v for v in self.link.motors[j[1]].gains)) for j in JOINTS])
+        self.toast("Driver gains backed up to the LightGateway flash")
+
+    def restore_gains(self):
+        self.link.send("#load")
+        self.restore_at = time.monotonic()  # update() fills the fields when the answer is in
+
+    def apply_motor(self, cid, quiet=False):
+        """One motor's gains and current limit; the Teensy reads the gains back. False when nothing went out."""
+        vals = [self.fields["t%d_%d" % (cid, k)].strip() for k in range(5)]
+        try:
+            gains = [float(v) for v in vals[:4]] if any(vals[:4]) else None  # all four or none
+            amps = float(vals[4]) if vals[4] else None
+            if (gains and min(gains) < 0) or (amps is not None and not 0.1 <= amps <= 60):
+                raise ValueError
+        except ValueError:
+            self.toast("Motor #%d: gains are four numbers ≥ 0, max current 0.1–60 A" % cid)
+            return False
+        lines = (["%d g %s" % (cid, " ".join("%g" % v for v in gains))] if gains else []) + \
+                (["%d m%g" % (cid, amps)] if amps else [])
+        if not lines:
+            if not quiet:
+                self.toast("Motor #%d: nothing to apply" % cid)
+            return False
+        self.cfg["tuning"][str(cid)] = vals
+        save(self.cfg)
+        self.link.send(*lines)
+        if not quiet:
+            self.toast("Applied to motor #%d" % cid)
+        return True
+
+    def apply_all(self):
+        done = sum(self.apply_motor(j[1], quiet=True) for j in JOINTS)
+        self.toast("Applied to every motor" if done == len(JOINTS) else "Applied to %d of %d motors" % (done, len(JOINTS)))
+
+    def apply_jam(self):
+        try:
+            deg, ms = float(self.fields["jam_err"]), int(self.fields["jam_ms"])
+            if deg <= 0 or ms <= 0:
+                raise ValueError
+        except ValueError:
+            self.toast("Jam tolerance above 0°, time above 0 ms (the switch turns it off)")
+            return
+        self.cfg.update(jam_err=deg, jam_ms=ms)
+        save(self.cfg)
+        self.link.send("j %g %d" % (deg, ms if self.cfg["jam_on"] else 0))  # time 0 = detection off on the Teensy
+        self.toast("Jam detection: %g° for %d ms" % (deg, ms) if self.cfg["jam_on"] else "Jam settings saved, detection is off")
+
+    def jam_enabled(self):
+        """What the Teensy last reported, else what the app asked for."""
+        jc = self.link.jam_cfg
+        return jc[1] > 0 if jc else bool(self.cfg["jam_on"])
+
+    def toggle_jam(self):
+        self.cfg["jam_on"] = 0 if self.jam_enabled() else 1
+        save(self.cfg)
+        jc = (self.cfg["jam_err"], self.cfg["jam_ms"] if self.cfg["jam_on"] else 0)
+        self.link.send("j %g %d" % jc)
+        if self.connected:  # show it now; the Teensy's J answer confirms it a moment later
+            self.link.jam_cfg = jc
+        self.toast("Jam detection on" if self.cfg["jam_on"] else
+                   "Jam detection off" + (": a joint already jammed still needs Clear jam" if self.jams else ""))
+
+    def step(self, deg):
+        if self.control:
+            self.toast("Turn Control off for a step test: it would pull the joint straight back")
+        elif self.sel in self.jams:
+            self.toast("That joint is jammed: Clear jam first")
+        else:  # at today's Speed %, so the curve shows the motion you will get
+            self.link.send(*self.speed_lines() + ["%d s%g" % (self.sel, deg)])
+            self.step_at, self.step_cid = time.monotonic(), self.sel
+
+    def capture(self, cid):
+        """(capture, metrics, hints) of the motor's last finished step test, or None."""
+        cap = self.link.captures.get(cid)
+        if cap and not cap["done"] and cap["samples"] and time.monotonic() - cap["last"] > 0.6:
+            cap.update(done=True, at=time.monotonic())  # its end line got lost on WiFi: use what arrived
+        if not cap or not cap["done"] or cap["fail"] or not cap["samples"]:
+            return None
+        if self.analysis.get(cid, (None,))[0] != cap["at"]:
+            n = max(cap["samples"]) + 1
+            cap["y"] = [cap["samples"].get(i, float("nan")) for i in range(n)]
+            rpm = self.cfg["roll_dps"] / 6 if cid == JOINTS[3][1] else self.rpm(cid)  # output rpm it should reach
+            m = tune.metrics(cap["y"], cap["dt"], cap["start"], cap["target"], rpm)
+            self.analysis[cid] = (cap["at"], m, tune.hints(m))
+        return (cap,) + self.analysis[cid][1:]
+
+    def suggested(self, cid, changes):
+        """[(gain index, now, suggested)] scaled from what the driver holds (the fields if it was not read),
+        so pressing Use suggestions twice does not scale twice."""
+        m = self.link.motors[cid]
+        now = list(m.gains) if m.gains_ok and m.gains else None
+        out = []
+        for k, factor in changes.items():
+            try:
+                v = now[k] if now else float(self.fields["t%d_%d" % (cid, k)])
+                kv = now[2] if now else float(self.fields["t%d_2" % cid])
+            except ValueError:
+                continue
+            out.append((k, v, 0.1 * kv if v == 0 and k == 3 else v * factor))  # no velocity Ki yet: 10 % of Kp
+        return out
+
+    def use_hints(self, cid):
+        """Write the suggested gains into the fields; Apply still sends them."""
+        changes = [s for _, ch in self.capture(cid)[2] for s in self.suggested(cid, ch)]
+        for k, _, new in changes:
+            self.fields["t%d_%d" % (cid, k)] = "%.4g" % new
+        self.toast("Suggested gains filled in for #%d: check them, then Apply" % cid if changes
+                   else "Read the gains first: there is nothing to scale")
+
+    def open_tab(self, i):
+        self.tab = i
+        if i == 1 and self.link.robot_online():
+            self.read_tuning()
 
     def clear_faults(self):
         self.link.send(*("%d c" % j[1] for j in JOINTS))  # clears driver faults and jams
@@ -313,7 +511,7 @@ class App:
             self.set_control(False, "Control OFF: calibration changed")
         self.cfg[key] = value
         save(self.cfg)
-        if key in ("speed", "rpm_max") and self.connected:
+        if key in ("speed", "rpm_max", "roll_units", "roll_dps") and self.connected:
             self.link.send(*self.speed_lines())
 
     def bump(self, key, step, lo, hi):
@@ -326,7 +524,8 @@ class App:
     def reset(self):
         if self.control:
             self.set_control(False, "Control OFF: settings reset")
-        self.cfg = dict(DEFAULTS, host=self.cfg["host"], port=self.cfg["port"])
+        keep = ("host", "port", "tuning", "jam_err", "jam_ms")  # connection and the Configuration tab stay
+        self.cfg = dict(DEFAULTS, **{k: self.cfg[k] for k in keep})
         self.fields["speed"] = str(self.cfg["speed"])
         save(self.cfg)
 
@@ -349,19 +548,20 @@ class App:
                     return
             if self.panel:
                 self.panel = None
-            elif self.control and self.tip_px and math.dist(e.pos, self.tip_px) < 24:
+            elif self.control and self.tab == 0 and self.tip_px and math.dist(e.pos, self.tip_px) < 24:
                 self.drag, self.drag_mm = True, self.to_mm(e.pos)
         elif e.type == pygame.MOUSEBUTTONUP and e.button == 1:
             self.drag = False
         elif e.type == pygame.MOUSEMOTION and self.drag:
             self.drag_mm = self.to_mm(e.pos)
             self.solve(self.drag_mm)
-        elif e.type == pygame.MOUSEWHEEL and self.control:
+        elif e.type == pygame.MOUSEWHEEL and self.control and self.tab == 0:
             self.tool = wrap(self.tool + 3 * e.y)
             self.solve(self.drag_mm if self.drag else fk(self.g, self.lengths())[-1])
         elif e.type == pygame.TEXTINPUT and self.focus:
-            if self.focus == "host" or e.text.isdigit():
-                self.fields[self.focus] = (self.fields[self.focus] + e.text)[:3 if self.focus == "speed" else 64]
+            ok = "0123456789" if self.focus in ("port", "speed") else None if self.focus == "host" else "0123456789.-"
+            if ok is None or all(ch in ok for ch in e.text):
+                self.fields[self.focus] = (self.fields[self.focus] + e.text)[:{"speed": 3, "host": 64}.get(self.focus, 12)]
         elif e.type == pygame.KEYDOWN:
             self.key(e.key)
 
@@ -372,17 +572,15 @@ class App:
             elif k in (pygame.K_RETURN, pygame.K_KP_ENTER):
                 if self.focus == "speed":
                     self.apply_speed()
-                else:
+                elif self.focus in ("host", "port"):
                     self.connect()
-                self.focus = None
-            elif k == pygame.K_TAB and self.focus != "speed":
+                self.focus = None  # tuning fields: Enter just confirms, Apply sends
+            elif k == pygame.K_TAB and self.focus in ("host", "port"):
                 self.focus = "port" if self.focus == "host" else "host"
             elif k == pygame.K_ESCAPE:
                 if self.focus == "speed":
                     self.fields["speed"] = str(self.cfg["speed"])  # Esc drops the edit
                 self.focus = None
-        elif k == pygame.K_SPACE:
-            self.set_control(not self.control)
         elif k == pygame.K_i:
             self.idle()
         elif k == pygame.K_ESCAPE:
@@ -393,6 +591,37 @@ class App:
 
     def update(self):
         self.link.poll()
+        for _, cid, _ in JOINTS:  # gains just read from a driver go into its fields, except the one being typed in
+            m = self.link.motors[cid]
+            if m.gains_at > self.gains_seen[cid]:
+                self.gains_seen[cid] = m.gains_at
+                if not m.gains_ok:
+                    self.toast("Motor #%d did not answer the gain read" % cid)
+                for k, v in enumerate(m.gains if m.gains_ok else ()):
+                    if self.focus != "t%d_%d" % (cid, k):
+                        self.fields["t%d_%d" % (cid, k)] = "%g" % v
+        end = self.link.backup_end
+        if self.restore_at and end and end[1] >= self.restore_at:
+            self.restore_at = 0.0
+            for cid, gains in self.link.backup.items():
+                for k, v in enumerate(gains):
+                    self.fields["t%d_%d" % (cid, k)] = "%g" % v
+            self.toast("Backup of %d motors in the fields: Apply all writes it to the drivers" % end[0] if end[0]
+                       else "No backup on the gateway yet: press Back up first")
+        if self.link.jam_at > self.jam_seen:
+            self.jam_seen = self.link.jam_at
+            deg, ms = self.link.jam_cfg
+            self.fields["jam_err"] = "%g" % deg
+            if ms:  # 0 only means off: keep the time to switch back on with
+                self.fields["jam_ms"] = str(ms)
+            self.cfg["jam_on"] = int(ms > 0)
+        if self.step_at and time.monotonic() - self.step_at > 4.5:  # the capture takes 2 s plus sending
+            cap = self.link.captures.get(self.step_cid)
+            if cap and cap["at"] >= self.step_at and cap["fail"]:
+                self.toast("Motor #%d did not take the step: is it online and in position mode?" % self.step_cid)
+            elif not cap or cap["at"] < self.step_at:
+                self.toast("No step data came back: the Teensy needs the latest motorcontroller.ino")
+            self.step_at = 0.0
         jams = {j[1] for j in JOINTS if self.link.motors[j[1]].jam}
         new = [j for j in JOINTS if j[1] in jams - self.jams]
         self.jams = jams
@@ -439,6 +668,14 @@ class App:
         self.hits.append((rect, fn))
         return fill
 
+    def toggle(self, surf, rect, on, fn):
+        """Pill switch: red with the knob on the right when on."""
+        pygame.draw.rect(surf, RED if on else PANEL2, rect, border_radius=rect.h // 2)
+        pygame.draw.rect(surf, RED_HI if on else LINE, rect, 1, border_radius=rect.h // 2)
+        k = rect.h // 2 - 3
+        pygame.draw.circle(surf, BEIGE if on else MUTED, (rect.right - k - 3 if on else rect.x + k + 3, rect.centery), k)
+        self.hits.append((rect, fn))
+
     def panel_bg(self, surf, r):
         pygame.draw.rect(surf, (0, 0, 0), r.move(0, 6), border_radius=14)
         pygame.draw.rect(surf, PANEL2, r, border_radius=14)
@@ -450,7 +687,8 @@ class App:
         W, H = surf.get_size()
         surf.fill(BG)
         content = pygame.Rect(0, TOP, W - SIDE, H - TOP)
-        self.draw_manual(surf, content)
+        self.tip_px = None  # only the Manual tab has a tip to drag
+        (self.draw_config if self.tab == 1 else self.draw_manual)(surf, content)
         self.draw_sidebar(surf, pygame.Rect(W - SIDE, TOP, SIDE, H - TOP))
         self.draw_top(surf, W)
         if self.panel == "conn":
@@ -470,8 +708,7 @@ class App:
         text(surf, "Connection", (r.x + 44, r.y + 2), 15, BEIGE, True)
         text(surf, status, (r.x + 44, r.y + 21), 12, col)
 
-        parts = [font(22, True).render("TWIN", True, BEIGE), font(22, True).render("ARM", True, RED_HI),
-                 font(13).render("   WIRELESS INTERFACE", True, MUTED)]
+        parts = [font(22, True).render("TWIN", True, BEIGE), font(22, True).render("ARM", True, RED_HI)]
         x = W // 2 - sum(p.get_width() for p in parts) // 2
         for p in parts:
             surf.blit(p, p.get_rect(midleft=(x, TOP // 2)))
@@ -486,6 +723,7 @@ class App:
         pygame.draw.rect(surf, PANEL, r)
         pygame.draw.line(surf, LINE, r.topleft, r.bottomleft)
         tabs = [("Manual", "Telemetry", icon_remote, None),
+                ("Config", "& tuning", icon_tune, None),
                 ("Teach &", "Replay", icon_replay, "Teach & Replay comes with the recording firmware"),
                 ("LoRa", "Master", icon_antenna, "The LoRa master arm comes after the radio link")]
         for i, (l1, l2, icon, later) in enumerate(tabs):
@@ -498,12 +736,13 @@ class App:
             icon(surf, (t.centerx, t.y + 27), col)
             text(surf, l1, (t.centerx, t.y + 54), 11, col, active, "center")
             text(surf, l2, (t.centerx, t.y + 68), 11, col, active, "center")
-            self.hits.append((t, (lambda m=later: self.toast(m)) if later else (lambda i=i: setattr(self, "tab", i))))
+            self.hits.append((t, (lambda m=later: self.toast(m)) if later else (lambda i=i: self.open_tab(i))))
 
     def draw_manual(self, surf, c):
         text(surf, "Manual Wireless Telemetry", (c.x + 18, c.y + 12), 20, BEIGE, True)
-        text(surf, "Control ON, then drag the red tip  ·  wheel: tool angle  ·  A / D: turret  ·  Q / E: wrist roll"
-                   "  ·  I: idle  ·  Space: control  ·  Esc: off", (c.x + 18, c.y + 40), 12, MUTED)
+        text(surf, "Control ON, then drag the red tip  ·  wheel: tool angle  ·  A / D: turret  ·  W / S: wrist pitch"
+                   "  ·  Q / E: wrist roll"
+                   "  ·  Space / Ctrl: close / open gripper  ·  I: idle  ·  Esc: control off", (c.x + 18, c.y + 40), 12, MUTED)
         body = pygame.Rect(c.x + 16, c.y + 64, c.w - 32, c.h - 80)
         gw = max(320, int(body.w * 0.34))
         self.draw_arm(surf, pygame.Rect(body.x, body.y, body.w - gw - 14, body.h))
@@ -566,10 +805,19 @@ class App:
         else:
             pygame.draw.circle(surf, DIM, tip, 7, 2)
 
-        tx = area.left + 62 if d == 1 else area.right - 62
+        tx = area.left + 78 if d == 1 else area.right - 78
         self.draw_turret(surf, (tx, area.y + 64))
-        dial = pygame.Rect(tx - 64, area.y + 22, 128, 110)
-        for i, r in enumerate(self.place_cards(area, pts, [dial])):  # the roll card sits by the tip
+        dial = pygame.Rect(tx - 64, area.y + 22, 128, 170)  # turret dial and gripper gauge
+        sw = pygame.Rect(area.right - 18 - 44, area.y + 14, 44, 24) if d == 1 else pygame.Rect(area.x + 18, area.y + 14, 44, 24)
+        on = self.jam_enabled()
+        self.toggle(surf, sw, on, self.toggle_jam)
+        label = "Jam detection %s" % ("on" if on else "off")
+        if d == 1:
+            text(surf, label, (sw.x - 10, sw.centery), 12, BEIGE if on else AMBER, True, "midright")
+        else:
+            text(surf, label, (sw.right + 10, sw.centery), 12, BEIGE if on else AMBER, True, "midleft")
+        jam_box = sw.inflate(150, 16).move(-75 if d == 1 else 75, 0)
+        for i, r in enumerate(self.place_cards(area, pts, [dial, jam_box])):  # the roll card sits by the tip
             self.card(surf, i, pts[i], r)
         if self.control and self.drag and not self.ik_exact:
             text(surf, "Target out of reach or past a joint limit: holding the nearest pose",
@@ -599,6 +847,143 @@ class App:
         text(surf, "%", (sf.right - 12, sf.centery), 15, MUTED, anchor="midright")
         text(surf, "Speed", (sf.x - 10, sf.centery), 13, BEIGE, True, "midright")
 
+    def draw_config(self, surf, c):
+        text(surf, "Configuration", (c.x + 18, c.y + 12), 20, BEIGE, True)
+        text(surf, "The drivers' own loop gains and current limit, jam detection on the Teensy  ·  whether gains written "
+                   "here survive power-off is untested: Back up to gateway keeps a copy to come back to",
+             (c.x + 18, c.y + 40), 12, MUTED)
+        body = pygame.Rect(c.x + 16, c.y + 64, c.w - 32, c.h - 80)
+        rw = max(340, int(body.w * 0.34))
+        self.draw_tuning(surf, pygame.Rect(body.x, body.y, body.w - rw - 14, body.h))
+        self.draw_step(surf, pygame.Rect(body.right - rw, body.y, rw, body.h))
+
+    def draw_tuning(self, surf, r):
+        pygame.draw.rect(surf, PANEL, r, border_radius=14)
+        text(surf, "Motor tuning", (r.x + 18, r.y + 14), 15, BEIGE, True)
+        text(surf, "Read fills the fields from the drivers. Amber = edited, not applied yet. Click a row for its step test.",
+             (r.x + 18, r.y + 36), 12, MUTED)
+        x0, cw, fw = r.x + 160, 98, 88
+        for k, name in enumerate(("Position Kp", "Position Ki", "Velocity Kp", "Velocity Ki", "Max current A")):
+            text(surf, name, (x0 + k * cw, r.y + 64), 12, MUTED, True)
+        for i, (name, cid, col) in enumerate(JOINTS):
+            m = self.link.motors[cid]
+            row = pygame.Rect(r.x + 10, r.y + 84 + i * 66, r.w - 20, 60)
+            if cid == self.sel:
+                pygame.draw.rect(surf, PANEL2, row, border_radius=10)
+                pygame.draw.rect(surf, col, (row.x, row.y + 10, 3, row.h - 20))
+            self.hits.append((row, lambda cid=cid: setattr(self, "sel", cid)))  # fields and buttons sit on top
+            pygame.draw.rect(surf, col, (row.x + 12, row.y + 14, 18, 4), border_radius=2)
+            text(surf, name, (row.x + 38, row.y + 7), 13, BEIGE, True)
+            alive = m.ok and time.monotonic() - m.seen < 1.0
+            state = "JAMMED" if m.jam else (MODES[m.mode] if m.mode < len(MODES) else "?") if alive else "offline"
+            text(surf, "#%d · %s" % (cid, state), (row.x + 38, row.y + 27), 11, RED_HI if m.jam else MUTED, m.jam)
+            for k in range(5):
+                f = pygame.Rect(x0 + k * cw, row.y + 6, fw, 32)
+                key = "t%d_%d" % (cid, k)
+                self.field(surf, f, key)
+                try:
+                    pos_ki = k == 1 and float(self.fields[key]) > 0
+                except ValueError:
+                    pos_ki = False
+                if pos_ki:  # SteadyWin's manual: position Ki 0 in most cases, or vibration may cause damage
+                    text(surf, "SteadyWin: keep 0", (f.x + 4, f.bottom + 3), 11, RED_HI, True)
+                elif k < 4 and m.gains_ok and m.gains and self.fields[key].strip() != "%g" % m.gains[k]:
+                    text(surf, "driver %g" % m.gains[k], (f.x + 4, f.bottom + 3), 11, AMBER)
+            bx = x0 + 5 * cw + 4
+            self.button(surf, pygame.Rect(bx, row.y + 6, 58, 32), "Read", lambda cid=cid: self.link.send("%d g" % cid), size=12)
+            self.button(surf, pygame.Rect(bx + 66, row.y + 6, 64, 32), "Apply", lambda cid=cid: self.apply_motor(cid), "on", 12)
+        y = r.y + 84 + len(JOINTS) * 66 + 8
+        self.button(surf, pygame.Rect(r.x + 20, y, 120, 36), "Read all", self.read_tuning)
+        self.button(surf, pygame.Rect(r.x + 150, y, 120, 36), "Apply all", self.apply_all, "on")
+        armed = time.monotonic() - self.backup_armed < 2
+        self.button(surf, pygame.Rect(r.x + 300, y, 170, 36), "Click to overwrite" if armed else "Back up to gateway",
+                    self.backup_gains, "danger" if armed else "plain")
+        self.button(surf, pygame.Rect(r.x + 480, y, 140, 36), "Restore backup", self.restore_gains)
+        end = self.link.backup_end
+        text(surf, "Gateway backup: %s" % (("%d motors" % end[0] if end[0] else "none") if end else "not checked"),
+             (r.x + 634, y + 18), 12, MUTED, anchor="midleft")
+
+        y += 64
+        pygame.draw.line(surf, LINE, (r.x + 18, y - 14), (r.right - 18, y - 14))
+        text(surf, "Jam detection (Teensy)", (r.x + 18, y), 15, BEIGE, True)
+        text(surf, "A joint this far from its target that stops moving for this long is held, and its moves are blocked.",
+             (r.x + 18, y + 22), 12, MUTED)
+        y += 50
+        on = self.jam_enabled()
+        self.toggle(surf, pygame.Rect(r.x + 18, y + 4, 44, 24), on, self.toggle_jam)
+        text(surf, "On" if on else "Off", (r.x + 72, y + 16), 13, BEIGE if on else AMBER, True, "midleft")
+        text(surf, "Tolerance (°)", (r.x + 118, y + 16), 13, BEIGE, anchor="midleft")
+        self.field(surf, pygame.Rect(r.x + 214, y, 70, 32), "jam_err")
+        text(surf, "Time (ms)", (r.x + 300, y + 16), 13, BEIGE, anchor="midleft")
+        self.field(surf, pygame.Rect(r.x + 372, y, 70, 32), "jam_ms")
+        self.button(surf, pygame.Rect(r.x + 456, y, 76, 32), "Apply", self.apply_jam, "on", 12)
+        jc = self.link.jam_cfg
+        now = ("Teensy now: %g° for %d ms" % jc if jc[1] else "Teensy now: off") if jc else "Teensy: not read yet"
+        text(surf, now, (r.x + 546, y + 16), 12, MUTED, anchor="midleft")
+
+    def draw_step(self, surf, r):
+        name, cid, col = next(j for j in JOINTS if j[1] == self.sel)
+        m = self.link.motors[cid]
+        pygame.draw.rect(surf, PANEL, r, border_radius=14)
+        text(surf, "Step response", (r.x + 18, r.y + 14), 15, BEIGE, True)
+        text(surf, "%s  #%d" % (name, cid), (r.right - 18, r.y + 16), 13, col, True, "topright")
+        text(surf, "Steps the joint from where it is, Control off. The Teensy records", (r.x + 18, r.y + 38), 12, MUTED)
+        text(surf, "it every 10 ms for 2 s; the app reads the curve and suggests gains.", (r.x + 18, r.y + 54), 12, MUTED)
+        bw = (r.w - 36 - 30) // 4
+        for k, deg in enumerate((-15, -5, 5, 15)):
+            self.button(surf, pygame.Rect(r.x + 18 + k * (bw + 10), r.y + 80, bw, 36), "%+d°" % deg,
+                        lambda deg=deg: self.step(deg))
+        g = pygame.Rect(r.x + 8, r.y + 126, r.w - 16, max(160, r.h - 126 - 196))
+        got = self.capture(cid)
+        waiting = time.monotonic() - self.step_at < 4 and (not got or got[0]["at"] < self.step_at)
+        if got:
+            cap, met, hs = got
+            pts = [(i * cap["dt"], v) for i, v in enumerate(cap["y"]) if not math.isnan(v)]
+            span = len(cap["y"]) * cap["dt"]
+            self.plot(surf, g, "Step %+.1f° at 100 Hz" % (cap["target"] - cap["start"]), "°",
+                      [(MUTED, [[(0, cap["target"]), (span, cap["target"])]]), (col, [pts])], (0, span),
+                      ("0 s", "%.1f s" % span), False, 1.0)
+        else:  # no step test yet: the live 10 Hz telemetry
+            self.graph(surf, g, "Angle and target, live 10 Hz", "°", [(cid, 5, MUTED), (cid, 4, col)], False, 2.0, win=10)
+        if waiting:
+            text(surf, "Capturing 2 s…", g.center, 14, AMBER, True, "center")
+        y = g.bottom + 10
+        pygame.draw.rect(surf, col, (r.x + 22, y + 7, 18, 4), border_radius=2)
+        text(surf, "actual", (r.x + 48, y), 12, BEIGE)
+        pygame.draw.rect(surf, MUTED, (r.x + 110, y + 7, 18, 4), border_radius=2)
+        text(surf, "target", (r.x + 136, y), 12, BEIGE)
+        alive = m.ok and time.monotonic() - m.seen < 1.0
+        text(surf, "now %+.2f°   %.2f A" % (m.deg, m.amps) if alive else "offline",
+             (r.right - 18, y), 12, BEIGE if alive else DIM, anchor="topright")
+
+        y += 28
+        pygame.draw.line(surf, LINE, (r.x + 18, y), (r.right - 18, y))
+        text(surf, "Suggestions", (r.x + 18, y + 10), 14, BEIGE, True)
+        if not got:
+            text(surf, "Run a step test: ±5° shows the fine behaviour, ±15° the full move.", (r.x + 18, y + 34), 12, MUTED)
+            return
+        cap, met, hs = got
+        if met:
+            text(surf, "overshoot %.0f %%  ·  rise %s  ·  settles %s  ·  off by %.2f°" % (
+                100 * met["overshoot"], "%.2f s" % met["rise"] if met["rise"] is not None else "–",
+                "%.2f s" % met["settle"] if met["settle"] is not None else "not in 2 s", met["sse"]),
+                (r.x + 18, y + 32), 12, MUTED)
+            text(surf, "peak speed %.0f°/s  ·  speed limit %.0f°/s at Speed %d %%" % (
+                met["speed"], met["limit"], self.cfg["speed"]), (r.x + 18, y + 50), 12, MUTED)
+        ly = y + 72
+        for msg, changes in hs[:4]:
+            if changes:
+                vals = self.suggested(cid, changes)
+                msg += ("  →  " + ", ".join("%s %.4g → %.4g" % (GAIN_NAMES[k], now, new) for k, now, new in vals)
+                        if vals else "  (Read the gains to see the values)")
+            for i, part in enumerate(wrap_text("•  " + msg, 12, r.w - 36)):
+                text(surf, part if i == 0 else "    " + part, (r.x + 18, ly), 12, AMBER if changes else BEIGE)
+                ly += 17
+            ly += 3
+        if any(changes for _, changes in hs):
+            self.button(surf, pygame.Rect(r.right - 18 - 150, y + 4, 150, 30), "Use suggestions",
+                        lambda: self.use_hints(cid), "on", 12)
+
     def draw_pose(self, layer, off, g, col, alpha):
         s = self.view[2]
         pts = [(x - off[0], y - off[1]) for x, y in map(self.to_screen, fk(g, self.lengths()))]
@@ -613,7 +998,8 @@ class App:
             pygame.draw.circle(layer, rgba, a, w / 2)
             pygame.draw.circle(layer, rgba, b, w / 2)
         for side in (-1, 1):  # gripper jaws
-            jx, jy = -uy * side * 13 * s, ux * side * 13 * s
+            spread = (5 + 12 * self.grip / 100) * s  # jaws follow the gripper opening
+            jx, jy = -uy * side * spread, ux * side * spread
             pygame.draw.line(layer, rgba, (palm[0] + jx, palm[1] + jy), (tx + jx * 0.6, ty + jy * 0.6), max(3, int(9 * s)))
 
     def place_cards(self, area, pts, avoid):
@@ -694,6 +1080,16 @@ class App:
         text(surf, "Turret %+.1f°" % self.turret, (x, y + r + 12), 13, BEIGE, True, "center")
         text(surf, "top view · open loop", (x, y + r + 28), 11, DIM, anchor="center")
 
+        gy = y + r + 52  # gripper gauge: Space closes, Ctrl opens
+        held = lambda *keys: self.control and not typing and any(k[key] for key in keys)
+        text(surf, "Gripper %.0f %% open" % self.grip, (x, gy), 13, BEIGE, True, "center")
+        bar = pygame.Rect(x - 60, gy + 12, 120, 8)
+        pygame.draw.rect(surf, PANEL2, bar, border_radius=4)
+        pygame.draw.rect(surf, RED_HI, (bar.x, bar.y, bar.w * self.grip / 100, bar.h), border_radius=4)
+        text(surf, "Space close", (bar.x, bar.bottom + 4), 11, BEIGE if held(pygame.K_SPACE) else DIM, True)
+        text(surf, "Ctrl open", (bar.right, bar.bottom + 4), 11, BEIGE if held(pygame.K_LCTRL, pygame.K_RCTRL) else DIM,
+             True, "topright")
+
     def draw_graphs(self, surf, r):
         legend = pygame.Rect(r.x, r.y, r.w, 38 + 22 * len(JOINTS))
         pygame.draw.rect(surf, PANEL, legend, border_radius=12)
@@ -714,17 +1110,15 @@ class App:
         specs = [("Tracking error  (target − actual)", "°", 1, True, 1.0),
                  ("Phase current", "A", 2, False, 0.5),
                  ("Temperature", "°C", 3, False, 4.0)]
-        for k, spec in enumerate(specs):
-            self.graph(surf, pygame.Rect(r.x, top + k * (gh + 10), r.w, gh), *spec)
+        for k, (title, unit, idx, symmetric, span) in enumerate(specs):
+            self.graph(surf, pygame.Rect(r.x, top + k * (gh + 10), r.w, gh), title, unit,
+                       [(cid, idx, col) for _, cid, col in JOINTS], symmetric, span)
 
-    def graph(self, surf, r, title, unit, idx, symmetric, min_span):
-        pygame.draw.rect(surf, PANEL, r, border_radius=12)
-        text(surf, title, (r.x + 14, r.y + 9), 13, BEIGE, True)
-        text(surf, unit, (r.right - 14, r.y + 10), 12, MUTED, anchor="topright")
-        plot = pygame.Rect(r.x + 50, r.y + 34, r.w - 64, r.h - 56)
-        now, win = time.monotonic(), self.cfg["window"]
+    def graph(self, surf, r, title, unit, lines, symmetric, min_span, win=None):
+        """Live telemetry. lines: (CAN id, history index, colour); index 1 error, 2 amps, 3 temp, 4 angle, 5 target."""
+        now, win = time.monotonic(), win or self.cfg["window"]
         series = []
-        for _, cid, col in JOINTS:
+        for cid, idx, col in lines:
             segs, seg = [], []
             for h in self.link.motors[cid].hist:
                 if h[0] < now - win:
@@ -738,10 +1132,18 @@ class App:
             if seg:
                 segs.append(seg)
             series.append((col, segs))
+        self.plot(surf, r, title, unit, series, (now - win, now), ("-%d s" % win, "now"), symmetric, min_span)
+
+    def plot(self, surf, r, title, unit, series, xs, xlabels, symmetric, min_span):
+        """series: (colour, [segments of (x, value)]), drawn over the x range xs."""
+        pygame.draw.rect(surf, PANEL, r, border_radius=12)
+        text(surf, title, (r.x + 14, r.y + 9), 13, BEIGE, True)
+        text(surf, unit, (r.right - 14, r.y + 10), 12, MUTED, anchor="topright")
+        plot = pygame.Rect(r.x + 50, r.y + 34, r.w - 64, r.h - 56)
         vals = [v for _, segs in series for seg in segs for _, v in seg]
         pygame.draw.line(surf, LINE, plot.bottomleft, plot.bottomright)
-        text(surf, "-%d s" % win, (plot.x, plot.bottom + 4), 11, DIM)
-        text(surf, "now", (plot.right, plot.bottom + 4), 11, DIM, anchor="topright")
+        text(surf, xlabels[0], (plot.x, plot.bottom + 4), 11, DIM)
+        text(surf, xlabels[1], (plot.right, plot.bottom + 4), 11, DIM, anchor="topright")
         if not vals:
             text(surf, "no data yet", plot.center, 12, DIM, anchor="center")
             return
@@ -765,7 +1167,8 @@ class App:
         for col, segs in series:
             for seg in segs:
                 if len(seg) > 1:
-                    pygame.draw.lines(surf, col, False, [(plot.right - (now - t) / win * plot.w, y(v)) for t, v in seg], 2)
+                    pygame.draw.lines(surf, col, False,
+                                      [(plot.x + (t - xs[0]) / (xs[1] - xs[0]) * plot.w, y(v)) for t, v in seg], 2)
         surf.set_clip(None)
 
     def draw_conn(self, surf):
@@ -863,7 +1266,7 @@ def main():
     pygame.draw.rect(icon, RED, icon.get_rect(), border_radius=8)
     icon_remote(icon, (16, 14), BEIGE)
     pygame.display.set_icon(icon)
-    pygame.display.set_caption("TwinArm · Wireless Interface")
+    pygame.display.set_caption("TwinArm")
     pygame.display.set_mode((1440, 880), pygame.RESIZABLE)
     app = App(sys.argv[1] if len(sys.argv) > 1 else None)
     clock = pygame.time.Clock()

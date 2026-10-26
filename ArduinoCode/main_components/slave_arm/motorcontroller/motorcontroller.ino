@@ -10,11 +10,15 @@
 //   <id> c       clear fault/jam  1 c   (shows the fault code left afterwards)
 //   <id> g [pos kp ki vel kp ki]  read, or write then read, the driver's loop gains   1 g 20 0.5 3 0.1
 //   <id> m<amps> max current      1 m8
+//   <id> s<deg>  step test: move by deg from where it is, sample every 10 ms for 2 s, send the curve   1 s5
 //   t <deg>      turret angle     t -30  (0 = centre)
+//   p <%>        gripper opening  p 40   (0 = closed, 100 = open, inside the hard limits)
 //   j [deg ms]   jam detection: read, or set tolerance and time (ms 0 = off)   j 4 400
 // The same commands arrive from the LightGateway on Serial2 (WiFi app), which gets one machine-readable
 // line per motor every TELEMETRY_MS:  T,id,ok,deg,target,amps,tempC,volts,busAmps,mode,fault,jammed
 // and answers to g and j:  P,id,ok,posKp,posKi,velKp,velKi   J,deg,ms
+// and to s:  S,id,begin,start,target,sampleMs  then S,id,i,deg,deg,... (10 samples from index i per line)
+//            then S,id,end  (or S,id,fail)
 // A joint that stops short of its target (see checkJam) holds where it stopped and ignores a/r until cleared.
 #include "GDZ.h"
 #include <Servo.h>
@@ -60,12 +64,13 @@ int stuckMs[MAX_ID + 1];
 const char *MODES[] = {"off", "volt", "current", "speed", "pos"};
 
 // Jammed = in position mode, far from the target, yet it moved less than a quarter of what its speed limit
-// allows in one sweep, for jamMs. Then it holds where it stopped instead of pushing on.
+// allows in one sweep (and under 1 deg, so a joint that is slow but moving is not a jam), for jamMs.
+// Then it holds where it stopped instead of pushing on.
 // ponytail: position-only stall check; add a phase-current threshold if slow moves under heavy load trip it.
 void checkJam(uint8_t id, float deg) {
   const GDZMotor &s = bus.m[id];
   float allowed = rpmSet[id] * 6 * TELEMETRY_MS / 1000.0f;  // deg per sweep at the speed limit
-  bool stuck = s.mode == 4 && fabsf(target[id] - deg) > jamErrDeg && fabsf(deg - lastDeg[id]) < 0.25f * allowed;
+  bool stuck = s.mode == 4 && fabsf(target[id] - deg) > jamErrDeg && fabsf(deg - lastDeg[id]) < min(0.25f * allowed, 1.0f);
   stuckMs[id] = stuck ? stuckMs[id] + TELEMETRY_MS : 0;
   lastDeg[id] = deg;
   if (jammed[id] || !jamMs || stuckMs[id] < jamMs) return;
@@ -113,6 +118,28 @@ void reportGains(uint8_t id, bool echo) {
                           ok ? "" : "  (no reply)");
 }
 
+// Step test for tuning: a step from where the joint is now, sampled far faster than the 10 Hz telemetry.
+// Blocks the loop for STEP_MS (no telemetry meanwhile), then sends the curve to the app.
+const int STEP_SAMPLE_MS = 10, STEP_MS = 2000;
+void stepTest(uint8_t id, float deg, bool echo) {
+  static float y[STEP_MS / STEP_SAMPLE_MS];
+  float start = bus.readPosition(id) ? bus.m[id].deg - zeroDeg[id] : target[id];
+  target[id] = start + deg;
+  if (!bus.moveTo(id, zeroDeg[id] + target[id])) { gateway.printf("S,%d,fail\n", id); return; }
+  int n = 0;
+  for (elapsedMillis t; n < STEP_MS / STEP_SAMPLE_MS;)
+    if (t >= (uint32_t)(n * STEP_SAMPLE_MS)) y[n++] = bus.readPosition(id) ? bus.m[id].deg - zeroDeg[id] : NAN;
+  gateway.printf("S,%d,begin,%.3f,%.3f,%d\n", id, start, target[id], STEP_SAMPLE_MS);
+  for (int i = 0; i < n; i += 10) {   // 10 samples a line: 20 WiFi datagrams instead of 200, fewer to lose
+    gateway.printf("S,%d,%d", id, i);
+    for (int k = i; k < i + 10 && k < n; k++) gateway.printf(",%.2f", y[k]);
+    gateway.print('\n');
+  }
+  gateway.printf("S,%d,end\n", id);
+  lastDeg[id] = y[n - 1];             // no false jam from the jump on the next sweep
+  if (echo) Serial.printf("motor %d: step %+.1f deg captured, %d samples\n", id, deg, n);
+}
+
 // Gripper opens and closes once, settles at idle, then the motors home.
 void homeAll() {
   grip(GRIPPER_OPEN_US);   delay(1000);
@@ -153,6 +180,13 @@ void command(String s, bool echo) {
     if (echo) Serial.printf("turret %.1f deg\n", deg);
     return;
   }
+  if (s.startsWith("p ")) {
+    float pct = constrain(s.substring(2).toFloat(), 0.0f, 100.0f);
+    sweeping = false;
+    grip(lroundf(GRIPPER_CLOSED_US + pct * (GRIPPER_OPEN_US - GRIPPER_CLOSED_US) / 100));
+    if (echo) Serial.printf("gripper %.0f %% open\n", pct);
+    return;
+  }
   if (s == "s") {
     sweeping = !sweeping;
     if (!sweeping) grip(GRIPPER_MID_US);
@@ -180,10 +214,11 @@ void command(String s, bool echo) {
     reportGains(id, echo);          // read back, so the app shows what the driver really holds
     return;
   }
-  if ((op == 'a' || op == 'r') && jammed[id]) {
+  if ((op == 'a' || op == 'r' || op == 's') && jammed[id]) {
     if (echo) Serial.printf("motor %d is jammed: '%d c' clears it\n", id, id);
     return;
   }
+  if (op == 's') { stepTest(id, v, echo); return; }
   if (op == 'c') { jammed[id] = false; stuckMs[id] = 0; }
   if (op == 'v') rpmSet[id] = v;
   if (op == 'a') target[id] = v;
