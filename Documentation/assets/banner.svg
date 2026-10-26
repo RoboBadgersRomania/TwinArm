@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="420" viewBox="0 0 1280 420" role="img" aria-labelledby="title">
+  <title id="title">TwinArm: teach-by-demonstration 6-DOF robotic arm with a passive wireless master</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0B0B0B"/>
+      <stop offset="0.6" stop-color="#120A0A"/>
+      <stop offset="1" stop-color="#2A080B"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.86" cy="0.58" r="0.38">
+      <stop offset="0" stop-color="#A4161A" stop-opacity="0.32"/>
+      <stop offset="1" stop-color="#A4161A" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="dots" width="24" height="24" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1" fill="#F2E8D5" fill-opacity="0.07"/>
+    </pattern>
+    <clipPath id="card"><rect width="1280" height="420" rx="20"/></clipPath>
+  </defs>
+
+  <g clip-path="url(#card)">
+    <rect width="1280" height="420" fill="url(#bg)"/>
+    <rect width="1280" height="420" fill="url(#dots)"/>
+    <rect width="1280" height="420" fill="url(#glow)"/>
+    <rect y="408" width="1280" height="12" fill="#8B0000"/>
+  </g>
+
+  <g font-family="'Segoe UI', 'Helvetica Neue', Helvetica, Arial, sans-serif">
+    <text x="72" y="104" fill="#C8333A" font-size="15" font-weight="600" letter-spacing="4">LEADER–FOLLOWER · RECORD · REPLAY</text>
+    <text x="66" y="200" font-size="104" font-weight="800" letter-spacing="4"><tspan fill="#F2E8D5">TWIN</tspan><tspan fill="#B3141B">ARM</tspan></text>
+    <rect x="72" y="226" width="84" height="5" rx="2.5" fill="#B3141B"/>
+    <text x="72" y="276" fill="#F2E8D5" fill-opacity="0.92" font-size="27">Teach-by-demonstration 6-DOF robotic arm</text>
+    <text x="72" y="312" fill="#F2E8D5" fill-opacity="0.92" font-size="27">with a passive wireless master</text>
+    <text x="72" y="372" fill="#F2E8D5" fill-opacity="0.55" font-size="13" letter-spacing="3">ROBOCHALLENGE 2026 · FREESTYLE SHOWCASE UNIVERSITY · TEAM BADGERLABS</text>
+  </g>
+
+  <!-- master: small, passive, beige -->
+  <g stroke="#F2E8D5" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <rect x="775" y="312" width="50" height="7" rx="2" fill="#F2E8D5" stroke="none" fill-opacity="0.85"/>
+    <polyline points="800,312 800,272 838,214 882,238" stroke-width="6"/>
+    <polyline points="896,229 886,238 896,247" stroke-width="3"/>
+    <g fill="#0B0B0B" stroke-width="2.5">
+      <circle cx="800" cy="272" r="7"/>
+      <circle cx="838" cy="214" r="6"/>
+      <circle cx="882" cy="238" r="5"/>
+    </g>
+  </g>
+
+  <!-- LoRa link -->
+  <g fill="none" stroke="#C8333A" stroke-width="2.5" stroke-linecap="round">
+    <path d="M912 224 A14 14 0 0 1 912 252"/>
+    <path d="M912 212 A26 26 0 0 1 912 264" stroke-opacity="0.7"/>
+    <path d="M912 200 A38 38 0 0 1 912 276" stroke-opacity="0.4"/>
+  </g>
+  <text x="884" y="312" fill="#F2E8D5" fill-opacity="0.6" font-family="'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" letter-spacing="2">LoRa 433 MHz</text>
+
+  <!-- follower: large, high-torque, dark red -->
+  <g stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <rect x="1025" y="352" width="110" height="14" rx="4" fill="#8B0000"/>
+    <polyline points="1080,352 1080,268 1150,158" stroke="#A4161A" stroke-width="17"/>
+    <polyline points="1150,158 1222,200" stroke="#A4161A" stroke-width="13"/>
+    <polyline points="1252,181 1234,200 1252,219" stroke="#A4161A" stroke-width="6"/>
+    <g fill="#0B0B0B" stroke="#F2E8D5" stroke-width="3">
+      <circle cx="1080" cy="268" r="16"/>
+      <circle cx="1150" cy="158" r="13"/>
+      <circle cx="1222" cy="200" r="10"/>
+    </g>
+  </g>
+</svg>
