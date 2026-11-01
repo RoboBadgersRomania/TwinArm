@@ -301,9 +301,13 @@ q_i(t)=q_{i,0}+\Delta q_i\left(10\tau^3-15\tau^4+6\tau^5\right),\qquad \tau=t/T
 ```text
 TwinArm/
 ├── ArduinoCode/
+│   ├── libraries/
+│   │   └── TwinLink/                     encrypted, frequency-hopping LoRa link shared by both gateways
 │   ├── main_components/
 │   │   ├── lightgateway/
-│   │   │   └── lightgateway.ino          WiFi ↔ UART bridge on the LightGateway 1.0 (ESP32-S3)
+│   │   │   └── lightgateway.ino          follower's LightGateway 1.0 (ESP32-S3): WiFi ↔ UART bridge + radio
+│   │   ├── master_arm/
+│   │   │   └── master_arm.ino            master's LightGateway: 3 MT6701 joints, 2 pots, radio, app link on USB
 │   │   └── slave_arm/
 │   │       ├── motorcontroller/          follower firmware (Teensy 4.1)
 │   │       │   ├── motorcontroller.ino     discovery, homing, serial jog console, gateway link
@@ -314,7 +318,7 @@ TwinArm/
 │           └── servotest.ino             standalone gripper servo test
 ├── InterfaceApp/                         pygame wireless interface
 │   ├── main.py                             the app
-│   ├── link.py · arm.py · tune.py          UDP link, side-view kinematics, step-response tuning hints (each self-tests)
+│   ├── link.py · arm.py · tune.py          WiFi / radio link, side-view kinematics, step-response tuning hints (each self-tests)
 │   └── sim.py                              fake gateway + arm for trying the app without hardware
 └── Documentation/
     ├── TwinArm___RoboChallenge.pdf       full technical report
@@ -409,7 +413,9 @@ Type a pulse width in microseconds (for example `1500`) in the Serial Monitor an
 
 ### Wireless interface: `InterfaceApp`
 
-A pygame app that drives and watches the follower over **WiFi**, through a LightGateway 1.0 mounted on the robot. The LoRa link to the master arm comes later on the same board.
+A pygame app that drives and watches the follower over **WiFi**, through a LightGateway 1.0 mounted on the robot, or over the **LoRa radio**, through the master arm's LightGateway on USB (type its COM port in the Connection panel). The *LoRa Master* tab shows the master arm (three MT6701 joints, the gripper and turret pots) and the radio link; *Follow master* lets the pots drive the gripper and turret while Control is ON.
+
+**Radio link** (`ArduinoCode/libraries/TwinLink`): the two gateways pair through a 16-byte key kept in each one's flash. Send `#key <32 hex digits>` to each gateway's USB serial, the same key on both (`python -c "import secrets; print(secrets.token_hex(16))"` makes one); `#key` alone prints a fingerprint to compare, `#test` runs the protocol self-test. Each connection starts with a challenge-response on that key (HMAC-SHA256, the key never goes on air) and a fresh AES-128 session key. Every frame is AES-GCM encrypted and authenticated, and hops to the next of 7 channels (433.3–434.5 MHz, SF5 / 500 kHz, 28 slots a second, `#hello` round trip 63–78 ms on the bench); a piece of a line that does not get through goes again in the next slot, on the next channel. Build both gateway sketches with RadioLib and this folder on the library path (`arduino-cli compile --libraries ArduinoCode/libraries …`, or copy `TwinLink` into the Arduino IDE sketchbook's `libraries`).
 
 ```mermaid
 %%{init: {"theme": "base", "themeVariables": {"fontFamily": "Segoe UI, Helvetica, Arial, sans-serif", "primaryColor": "#0B0B0B", "primaryTextColor": "#F2E8D5", "primaryBorderColor": "#A4161A", "lineColor": "#A4161A", "textColor": "#F2E8D5", "edgeLabelBackground": "#1A1212"}}}%%

@@ -1,7 +1,9 @@
-"""TwinArm wireless interface: drive and watch the follower arm over WiFi through the LightGateway.
+"""TwinArm wireless interface: drive and watch the follower arm over WiFi through its LightGateway, or over the
+LoRa radio through the master arm's LightGateway on USB; the LoRa Master tab shows the master arm and the link.
 
-python main.py              connect from the Connection tab (gateway's own network: 192.168.4.1:4210)
+python main.py              connect from the Connection tab (gateway's own network: 192.168.4.1:4210, radio: COMxx)
 python main.py 127.0.0.1    connect straight away, e.g. to python sim.py running in another terminal
+python main.py COM13        the master's gateway on USB: the same control, relayed over the radio
 """
 import csv
 import json
@@ -15,7 +17,7 @@ import pygame
 import compare
 import tune
 from arm import fk, ik, wrap
-from link import MODES, Link
+from link import MODES, RADIO_STATES, Link, is_serial
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(HERE, "settings.json")
@@ -41,6 +43,7 @@ DEFAULTS = {
     "zero1": 80, "zero2": -132, "zero3": 52,    # joint angles as drawn at the arm zero (the idle pose photo)
     "sign1": -1, "sign2": 1, "sign3": -1, "sign4": -1, "sign_t": 1,  # motor direction against the drawing (checked on the arm)
     "sign_g": -1,                               # gripper: on the real one the 1350 us end opens it, so "p" runs reversed
+    "sign_pg": 1, "sign_pt": 1,                 # master arm pots (gripper, turret) against the follower, LoRa Master tab
     "table": 110,                               # mm from the shoulder axis down to the table: tip never goes below
     "limit": 150, "turret_limit": 90,           # +- degrees from the arm zero
     "turret_rate": 60,                          # deg/s at 100 % while A/D is held (W/S runs at the joint speed)
@@ -74,7 +77,7 @@ ROWS = [  # label, key[, step, min, max]; no step = toggle, key None = section t
     ("Graph window (s)", "window", 5, 5, 120), ("Mirror view (arm faces left)", "mirror"),
 ]
 GAIN_NAMES = ("Position Kp", "Position Ki", "Velocity Kp", "Velocity Ki")  # tune.py's gain index order
-CALIBRATION = {"zero1", "zero2", "zero3", "sign1", "sign2", "sign3", "sign4", "sign_t", "sign_g"}
+CALIBRATION = {"zero1", "zero2", "zero3", "sign1", "sign2", "sign3", "sign4", "sign_t", "sign_g", "sign_pg", "sign_pt"}
 
 
 def load():
@@ -194,6 +197,7 @@ class App:
         self.focus = self.panel = None
         self.tab = 0
         self.connected = self.control = self.drag = False
+        self.follow = False             # the master's pots drive the gripper and turret (with Control ON)
         self.g = self.zero()            # commanded joint angles as drawn
         self.tool = sum(self.g)         # tool angle kept while dragging, wheel changes it
         self.roll = self.turret = 0.0   # commanded, in the drawing's direction
@@ -206,6 +210,7 @@ class App:
         self.toast_msg, self.toast_at, self.release_armed = "", 0.0, 0.0
         self.hits, self.view, self.tip_px, self.cursor, self.layer = [], (0, 0, 1, 1), None, None, None
         self.card_pick = {}             # chosen spot per info card, kept while it stays clear
+        self.ports, self.ports_at = [], 0.0  # USB serial ports seen, for the Connection panel
         self.running = True
         if host:
             self.connect()
@@ -227,6 +232,19 @@ class App:
     def grip_from(self, p):
         """% open for a Teensy "p" value, and back: the same mapping both ways."""
         return p if self.cfg["sign_g"] > 0 else 100 - p
+
+    def following(self):
+        return self.follow and self.link.master_online()
+
+    def pot_grip(self):
+        """% open the master's gripper pot asks for."""
+        p = self.link.master["pots"][0]
+        return p if self.cfg["sign_pg"] > 0 else 100 - p
+
+    def pot_turret(self):
+        """Turret angle the master's turret pot asks for: its travel spans the turret limits."""
+        tl = self.cfg["turret_limit"]
+        return clamp(self.cfg["sign_pt"] * (self.link.master["pots"][1] / 50 - 1) * tl, -tl, tl)
 
     def measured(self):
         if not self.link.robot_online():
@@ -277,11 +295,14 @@ class App:
         if not self.link.robot_online():
             self.set_control(False, "Telemetry lost: control OFF, the arm holds its last target")
             return
+        fol = self.following()
         if self.focus is None:
             k = pygame.key.get_pressed()
             tl = self.cfg["turret_limit"]
             pct = self.cfg["speed"] / 100
-            self.turret = clamp(self.turret + (k[pygame.K_a] - k[pygame.K_d]) * self.cfg["turret_rate"] * pct * dt, -tl, tl)
+            if not fol:
+                self.turret = clamp(self.turret + (k[pygame.K_a] - k[pygame.K_d]) * self.cfg["turret_rate"] * pct * dt,
+                                    -tl, tl)
             # deg/s = the speed limit each driver got, so the target never runs ahead of the motor
             turn = k[pygame.K_q] - k[pygame.K_e]  # Q left, E right, like A/D
             if turn:  # the target leads the real roll by 15 deg at most, so it stops soon after the key is let go
@@ -295,7 +316,10 @@ class App:
                 if min(p[1] for p in fk(g, self.lengths())[1:]) >= 15 - self.cfg["table"]:  # not into the table
                     self.g, self.tool = g, sum(g)  # a drag afterwards keeps this wrist angle
             ctrl = k[pygame.K_LCTRL] or k[pygame.K_RCTRL]
-            self.grip = clamp(self.grip + (ctrl - k[pygame.K_SPACE]) * self.cfg["grip_rate"] * dt, 0, 100)
+            if not fol:
+                self.grip = clamp(self.grip + (ctrl - k[pygame.K_SPACE]) * self.cfg["grip_rate"] * dt, 0, 100)
+        if fol:  # joints follow too once the master's angles are matched to the follower's
+            self.grip, self.turret = self.pot_grip(), self.pot_turret()
         targets = {JOINTS[i][1]: self.motor(i, self.g[i]) for i in range(3)}
         targets[JOINTS[3][1]] = self.cfg["sign4"] * self.roll
         targets["t"] = self.cfg["sign_t"] * self.turret
@@ -312,14 +336,23 @@ class App:
 
     def connect(self):
         host, port = self.fields["host"].strip(), self.fields["port"].strip()
-        if not port.isdigit() or not 0 < int(port) < 65536:
+        radio = is_serial(host)  # the master's gateway on USB
+        if not radio and (not port.isdigit() or not 0 < int(port) < 65536):
             self.toast("Port must be a number from 1 to 65535")
             return
-        self.cfg.update(host=host, port=int(port))
+        try:
+            self.link.connect(host, 0 if radio else int(port))
+        except ImportError:
+            self.toast("The radio link needs pyserial: pip install pyserial")
+            return
+        except OSError:
+            self.toast("Cannot open %s: wrong port, or busy (close the Arduino serial monitor)" % host)
+            return
+        self.cfg.update(host=host, port=int(port) if port.isdigit() else self.cfg["port"])
         save(self.cfg)
-        self.link.connect(host, int(port))
         self.connected, self.hello_at = True, time.monotonic()
-        self.toast("Talking to the gateway at %s:%s" % (host, port))
+        self.toast("Talking to the master's gateway on %s, by radio to the follower" % host if radio
+                   else "Talking to the gateway at %s:%s" % (host, port))
 
     def toggle_connect(self):
         if not self.connected:
@@ -330,6 +363,23 @@ class App:
         self.link.close()
         self.connected = False
         self.toast("Disconnected")
+
+    def serial_ports(self):
+        """USB serial ports, for the radio link through the master's gateway; looked up every 2 s."""
+        if time.monotonic() - self.ports_at > 2:
+            self.ports_at = time.monotonic()
+            try:
+                from serial.tools import list_ports
+                self.ports = sorted(p.device for p in list_ports.comports())
+            except ImportError:  # no pyserial: the toast on Connect says so
+                self.ports = []
+        return self.ports
+
+    def use_port(self, port):
+        if self.control:
+            self.set_control(False)
+        self.fields["host"] = port
+        self.connect()
 
     def speed_lines(self):
         """Joint speed for every driver: Speed % of the 100 % rpm."""
@@ -618,6 +668,11 @@ class App:
         self.fields["speed"] = str(self.cfg["speed"])
         save(self.cfg)
 
+    def toggle_follow(self):
+        self.follow = not self.follow
+        self.toast("Follow ON: with Control ON the master's pots drive the gripper and turret" if self.follow
+                   else "Follow OFF: Space / Ctrl and A / D drive the gripper and turret again")
+
     def toggle_panel(self, name):
         self.panel = None if self.panel == name else name
 
@@ -734,13 +789,18 @@ class App:
     # ---------- drawing ----------
 
     def status(self):
+        L = self.link
         if not self.connected:
             return MUTED, "Not connected"
-        if self.link.robot_online():
-            return GREEN, "Arm online · %.0f Hz telemetry" % self.link.rate()
-        if self.link.gateway_online():
-            return AMBER, "Gateway online · no arm telemetry"
-        return RED_HI, "Waiting for the gateway…"
+        via = " by radio" if L.ser else ""
+        if L.robot_online():
+            return GREEN, "Arm online%s · %.0f Hz telemetry" % (via, L.rate())
+        if L.gateway_online():
+            return AMBER, "Gateway online%s · no arm telemetry" % via
+        rd = L.radio_status()
+        if L.ser and rd:
+            return AMBER, "Master online · radio %s" % {-2: "missing", -1: "has no key", 0: "searching"}.get(rd["state"], "up")
+        return RED_HI, "Waiting for the master's gateway…" if L.ser else "Waiting for the gateway…"
 
     def button(self, surf, rect, label, fn, kind="plain", size=14, bold=False):
         fill, edge, ink = {"plain": (PANEL2, LINE, BEIGE), "on": (RED, RED_HI, BEIGE),
@@ -779,7 +839,7 @@ class App:
         surf.fill(BG)
         content = pygame.Rect(0, TOP, W - SIDE, H - TOP)
         self.tip_px = None  # only the Manual tab has a tip to drag
-        (self.draw_config if self.tab == 1 else self.draw_manual)(surf, content)
+        (self.draw_config if self.tab == 1 else self.draw_master if self.tab == 3 else self.draw_manual)(surf, content)
         self.draw_sidebar(surf, pygame.Rect(W - SIDE, TOP, SIDE, H - TOP))
         self.draw_top(surf, W)
         if self.panel == "conn":
@@ -816,7 +876,7 @@ class App:
         tabs = [("Manual", "Telemetry", icon_remote, None),
                 ("Config", "& tuning", icon_tune, None),
                 ("Teach &", "Replay", icon_replay, "Teach & Replay comes with the recording firmware"),
-                ("LoRa", "Master", icon_antenna, "The LoRa master arm comes after the radio link")]
+                ("LoRa", "Master", icon_antenna, None)]
         for i, (l1, l2, icon, later) in enumerate(tabs):
             t = pygame.Rect(r.x + 8, r.y + 12 + i * 96, r.w - 16, 86)
             active = i == self.tab
@@ -947,6 +1007,102 @@ class App:
         rw = max(340, int(body.w * 0.34))
         self.draw_tuning(surf, pygame.Rect(body.x, body.y, body.w - rw - 14, body.h))
         self.draw_step(surf, pygame.Rect(body.right - rw, body.y, rw, body.h))
+
+    def draw_master(self, surf, c):
+        text(surf, "LoRa Master", (c.x + 18, c.y + 12), 20, BEIGE, True)
+        text(surf, "The master arm and its encrypted, frequency-hopping 433 MHz link to the follower  ·  the joints "
+                   "follow once their angles are matched to the follower's", (c.x + 18, c.y + 40), 12, MUTED)
+        body = pygame.Rect(c.x + 16, c.y + 64, c.w - 32, c.h - 80)
+        rw = max(340, int(body.w * 0.3))
+        self.draw_master_arm(surf, pygame.Rect(body.x, body.y, body.w - rw - 14, body.h))
+        self.draw_radio(surf, pygame.Rect(body.right - rw, body.y, rw, body.h))
+
+    def draw_master_arm(self, surf, r):
+        pygame.draw.rect(surf, PANEL, r, border_radius=14)
+        ms = self.link.master if self.link.master_online() else None
+        text(surf, "Master arm", (r.x + 18, r.y + 14), 15, BEIGE, True)
+        text(surf, "live" if ms else "No data: connect to the master's COM port, or to the follower over WiFi with the "
+             "radio up", (r.x + 18, r.y + 36), 12, GREEN if ms else MUTED)
+        dr = max(30, min(72, r.w // 6 - 30))
+        cy = r.y + 76 + dr
+        for j in range(3):
+            cx = r.x + r.w * (2 * j + 1) // 6
+            ok = ms and ms["ok"][j]
+            self.dial(surf, (cx, cy), dr, ms["deg"][j] if ok else None)
+            text(surf, "Joint %d" % (j + 1), (cx, cy + dr + 18), 14, BEIGE, True, "center")
+            text(surf, "%.2f°" % ms["deg"][j] if ok else "no reading" if ms else "–", (cx, cy + dr + 38), 14,
+                 BEIGE if ok else RED_HI if ms else MUTED, anchor="center")
+            text(surf, "mux SD%d / SC%d" % (j, j), (cx, cy + dr + 58), 11, DIM, anchor="center")
+        y = cy + dr + 92
+        pots = (("Gripper pot", "GPIO1", "sign_pg", lambda: "%.0f %% open" % self.pot_grip()),
+                ("Turret pot", "GPIO2", "sign_pt", lambda: "turret %+.1f°" % self.pot_turret()))
+        for k, (name, pin, key, to) in enumerate(pots):
+            row = pygame.Rect(r.x + 18, y + k * 62, r.w - 36, 54)
+            text(surf, name, (row.x, row.y), 14, BEIGE, True)
+            text(surf, pin, (row.x + 104, row.y + 2), 12, DIM)
+            bar = pygame.Rect(row.x, row.y + 26, row.w - 136, 10)
+            pygame.draw.rect(surf, PANEL2, bar, border_radius=5)
+            if ms:
+                text(surf, "%.1f %%  →  %s" % (ms["pots"][k], to()), (bar.right, row.y), 13, BEIGE, anchor="topright")
+                pygame.draw.rect(surf, RED_HI, (bar.x, bar.y, bar.w * clamp(ms["pots"][k], 0, 100) / 100, bar.h),
+                                 border_radius=5)
+            inv = self.cfg[key] < 0
+            self.button(surf, pygame.Rect(row.right - 120, row.y + 12, 120, 30), "Inverted" if inv else "Normal",
+                        lambda key=key: self.flip(key), "on" if inv else "plain", 12)
+        y += 2 * 62 + 14
+        pygame.draw.line(surf, LINE, (r.x + 18, y), (r.right - 18, y))
+        sw = pygame.Rect(r.x + 18, y + 18, 52, 28)
+        self.toggle(surf, sw, self.follow, self.toggle_follow)
+        text(surf, "Follow master", (sw.right + 12, sw.y - 2), 14, BEIGE, True)
+        text(surf, "With Control ON (Manual tab) the pots drive the gripper and turret, in place of Space / Ctrl and A / D",
+             (sw.right + 12, sw.y + 18), 12, MUTED)
+
+    def dial(self, surf, c, r, deg):
+        """A sensor angle, 0° at the top; None: no reading."""
+        x, y = c
+        pygame.draw.circle(surf, PANEL2, c, r)
+        pygame.draw.circle(surf, LINE, c, r, 1)
+        for k in range(12):  # every 30°
+            a = math.radians(k * 30)
+            pygame.draw.line(surf, DIM, (x + math.sin(a) * (r - 7), y - math.cos(a) * (r - 7)),
+                             (x + math.sin(a) * r, y - math.cos(a) * r))
+        if deg is not None:
+            a = math.radians(deg)
+            pygame.draw.line(surf, RED_HI, c, (x + math.sin(a) * (r - 12), y - math.cos(a) * (r - 12)), 4)
+        pygame.draw.circle(surf, BEIGE, c, 5)
+
+    def draw_radio(self, surf, r):
+        pygame.draw.rect(surf, PANEL, r, border_radius=14)
+        text(surf, "Radio link", (r.x + 18, r.y + 14), 15, BEIGE, True)
+        rd = self.link.radio_status()
+        y = r.y + 46
+        if rd:
+            st, up = rd["state"], rd["state"] == 1
+            here, there = ("master", "follower") if rd["role"] == "m" else ("follower", "master")
+            rows = [("Reported by", "the %s's gateway" % here, BEIGE),
+                    ("Link", RADIO_STATES.get(st, "?"), GREEN if up else AMBER if st == 0 else RED_HI),
+                    ("Slots", "%d / s, %d %% got through" % (rd["rate"], rd["ok"]) if up else "–", BEIGE),
+                    ("Signal at the %s" % here, "%.0f dBm, SNR %.1f dB" % (rd["rssi"], rd["snr"]) if up else "–", BEIGE),
+                    ("Signal at the %s" % there, "%.0f dBm, SNR %.1f dB" % (rd["peer_rssi"], rd["peer_snr"])
+                     if up and rd["peer_rssi"] else "–", BEIGE),  # the follower does not get the master's reading
+                    ("Channel now", "%.2f MHz" % rd["mhz"], BEIGE)]
+            for label, value, col in rows:
+                text(surf, label, (r.x + 18, y), 13, MUTED)
+                text(surf, value, (r.right - 18, y), 13, col, True, "topright")
+                y += 26
+        else:
+            text(surf, "No radio status yet", (r.x + 18, y), 13, MUTED)
+            y += 26
+        y += 12
+        for note in ("Pairing: both gateways keep the same 16-byte key in flash. Send  #key <32 hex digits>  to each "
+                     "one's USB serial; #key alone shows its fingerprint, to compare.",
+                     "Each connection starts with a challenge-response on that key and a new AES-128 session key. Every "
+                     "frame is encrypted and signed and hops to the next of 7 channels, 433.3–434.5 MHz; a lost piece "
+                     "of a line goes again on the next channel."):
+            for ln in wrap_text(note, 12, r.w - 36):
+                text(surf, ln, (r.x + 18, y), 12, DIM)
+                y += 17
+            y += 10
 
     def draw_tuning(self, surf, r):
         pygame.draw.rect(surf, PANEL, r, border_radius=14)
@@ -1213,7 +1369,9 @@ class App:
         text(surf, "A", (x - r - 14, y), 14, BEIGE if self.control and k[pygame.K_a] and not typing else DIM, True, "center")
         text(surf, "D", (x + r + 14, y), 14, BEIGE if self.control and k[pygame.K_d] and not typing else DIM, True, "center")
         text(surf, "Turret %+.1f°" % self.turret, (x, y + r + 12), 13, BEIGE, True, "center")
-        text(surf, "top view · open loop", (x, y + r + 28), 11, DIM, anchor="center")
+        fol = self.following()
+        text(surf, "follows the master's pots" if fol else "top view · open loop", (x, y + r + 28), 11,
+             AMBER if fol else DIM, anchor="center")
 
         gy = y + r + 52  # gripper gauge: Space closes, Ctrl opens
         held = lambda *keys: self.control and not typing and any(k[key] for key in keys)
@@ -1307,11 +1465,11 @@ class App:
         surf.set_clip(None)
 
     def draw_conn(self, surf):
-        r = pygame.Rect(12, TOP + 8, 380, 330)
+        r = pygame.Rect(12, TOP + 8, 380, 362)
         self.panel_bg(surf, r)
         text(surf, "Connection", (r.x + 18, r.y + 14), 17, BEIGE, True)
-        text(surf, "LightGateway 1.0 over WiFi (UDP)", (r.x + 18, r.y + 38), 12, MUTED)
-        text(surf, "Gateway IP", (r.x + 18, r.y + 62), 12, MUTED)
+        text(surf, "LightGateway 1.0: WiFi (UDP), or the master's USB for the radio", (r.x + 18, r.y + 38), 12, MUTED)
+        text(surf, "Gateway IP or COM port", (r.x + 18, r.y + 62), 12, MUTED)
         text(surf, "Port", (r.x + 252, r.y + 62), 12, MUTED)
         self.field(surf, pygame.Rect(r.x + 18, r.y + 80, 222, 34), "host")
         self.field(surf, pygame.Rect(r.x + 252, r.y + 80, 110, 34), "port")
@@ -1320,17 +1478,33 @@ class App:
         L = self.link
         online = [m for m in L.motors.values() if m.ok and time.monotonic() - m.seen < 1.0]
         gw = self.connected and L.gateway_online()
-        rows = [("WiFi gateway", "online" if gw else "offline", GREEN if gw else RED_HI),
-                ("Round trip", "%d ms" % L.rtt if gw and L.rtt is not None else "–", BEIGE),
-                ("WiFi signal", "%d dBm" % L.rssi if gw and L.rssi else "–", BEIGE),
-                ("Arm telemetry", "%d / %d motors · %.0f Hz" % (len(online), len(L.motors), L.rate()) if online else "none",
-                 GREEN if online else MUTED),
-                ("Bus voltage", "%.1f V" % (sum(m.volts for m in online) / len(online)) if online else "–", BEIGE)]
+        arm = ("Arm telemetry", "%d / %d motors · %.0f Hz" % (len(online), len(L.motors), L.rate()) if online else "none",
+               GREEN if online else MUTED)
+        rtt = ("Round trip", "%d ms" % L.rtt if gw and L.rtt is not None else "–", BEIGE)
+        rd = L.radio_status() if L.ser else None
+        if L.ser:  # the master's gateway on USB, the radio to the follower's
+            up = rd and rd["state"] == 1
+            rows = [("Master gateway (USB)", "online" if rd else "offline", GREEN if rd else RED_HI),
+                    ("Radio link", RADIO_STATES.get(rd["state"], "?") if rd else "–", GREEN if up else AMBER), rtt,
+                    ("Radio signal", "%.0f dBm · SNR %.1f dB" % (rd["rssi"], rd["snr"]) if up else "–", BEIGE), arm]
+        else:
+            rows = [("WiFi gateway", "online" if gw else "offline", GREEN if gw else RED_HI), rtt,
+                    ("WiFi signal", "%d dBm" % L.rssi if gw and L.rssi else "–", BEIGE), arm,
+                    ("Bus voltage", "%.1f V" % (sum(m.volts for m in online) / len(online)) if online else "–", BEIGE)]
         for k, (label, value, col) in enumerate(rows):
             y = r.y + 180 + k * 24
             text(surf, label, (r.x + 18, y), 13, MUTED)
             text(surf, value, (r.right - 18, y), 13, col, True, "topright")
-        text(surf, "Join the TwinArm WiFi first (192.168.4.1). Simulator: 127.0.0.1", (r.x + 18, r.bottom - 28), 11, DIM)
+        y, x = r.y + 304, r.x + 18  # one click: the radio through the master's gateway on that port
+        text(surf, "Radio via USB", (x, y + 3), 12, MUTED)
+        x += 92
+        for p in self.serial_ports()[:3]:
+            on = L.ser is not None and L.ser.port == p
+            self.button(surf, pygame.Rect(x, y, 80, 24), p, lambda p=p: self.use_port(p), "on" if on else "plain", 12)
+            x += 88
+        if not self.ports:
+            text(surf, "no USB serial port", (x, y + 3), 12, DIM)
+        text(surf, "WiFi 192.168.4.1 (join TwinArm) · simulator 127.0.0.1", (r.x + 18, r.bottom - 26), 11, DIM)
 
     def field(self, surf, rect, key):
         focused = self.focus == key

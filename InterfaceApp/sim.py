@@ -4,6 +4,7 @@ python sim.py, then python main.py 127.0.0.1. Speaks the same lines as the real 
 follows the console commands and sends T lines at 10 Hz. Each joint is a toy spring-damper driven by its
 position Kp and velocity Kp (g command), capped at its rpm, so step tests react to tuning.
 The elbow (#2) hits a fake obstacle at +70 deg and jams, with the same rule as checkJam on the Teensy.
+It also passes on a fake master arm (M lines, joint 3 without a reading) and a radio link that is up (L lines).
 
 python sim.py --model step_tests/model_fit.json   joints move like the real ones fitted by compare.py / the app's
 whole-arm test, starting with the gains they were measured with; changing gains scales the fit like a cascaded
@@ -157,4 +158,9 @@ while True:
                 i, m["deg"] + random.gauss(0, 0.03), m["target"], m["amps"], m["temp"], 24.3 + random.gauss(0, 0.05),
                 abs(m["amps"]) * 0.32, m["mode"], m["fault"], m["jam"])
             sock.sendto(line.encode(), pc)
+        # the master arm over the radio, as the follower's gateway passes it on: slow sweeps, joint 3 unplugged
+        sock.sendto(("M,%.2f,%.2f,-1,%.1f,%.1f,3\n" % (180 + 60 * math.sin(now * 0.5), 90 + 40 * math.sin(now * 0.7),
+                                                     50 + 45 * math.sin(now * 0.3), 50 + 45 * math.sin(now * 0.2))).encode(), pc)
+        if int(now) != int(now - 0.1):
+            sock.sendto(b"L,f,1,31,%d,-48,9.0,-51,8.5,433.70\n" % random.randint(94, 100), pc)
     time.sleep(0.002)
