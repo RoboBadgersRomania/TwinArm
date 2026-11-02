@@ -9,7 +9,7 @@
 //        joints 0..360 deg, -1 = no reading
 //        L,m,...   the radio link once a second (see TwinLink.h);  every line the follower's gateway sends back
 //   in   #key [<32 hex digits>]   shows / sets the radio key (it never leaves this board);  #radio  frame counts;
-//        #test   radio self-test;  #scan  which mux channels have an MT6701
+//        #test   radio self-test;  #scan  which mux channels have an MT6701;  #pot  the roll pot's last readings
 //        any other line goes over the radio to the follower's gateway, as if the app had sent it there over WiFi
 // Board: "ESP32S3 Dev Module", USB CDC On Boot enabled. Libraries: RadioLib, TwinLink (ArduinoCode/libraries).
 #ifndef ARDUINO_ARCH_ESP32
@@ -55,15 +55,49 @@ int readRaw() {
   return hi << 6 | lo >> 2;
 }
 
-// The roll pot's wiper once a millisecond; readArm sends the mean since the last frame. A single analogRead
-// jitters by about 5 % of the travel (14 deg of wrist roll), 50 of them averaged by about a seventh of that.
-uint32_t potSum = 0, potN = 0;
+// The roll pot's wiper about once a millisecond, kept with its time; readArm sends the mean of the last 40 ms.
+// 40 ms is two periods of the 50 Hz mains, which a long or loose pot wire picks up (seen at +-10 % of the travel):
+// a mean over whole periods cancels it, where a single reading or a 50 ms mean does not. #pot shows the window.
+const int POT_MAX = 64;
+const uint32_t POT_WINDOW_US = 40000;
+uint16_t potV[POT_MAX];
+uint32_t potT[POT_MAX];
+int potHead = 0, potCount = 0;
 void samplePot() {
   static uint32_t at = 0;
   if (micros() - at < 1000) return;
   at = micros();
-  potSum += analogRead(ROLL_POT);
-  potN++;
+  potV[potHead] = analogRead(ROLL_POT);
+  potT[potHead] = at;
+  potHead = (potHead + 1) % POT_MAX;
+  potCount = min(potCount + 1, POT_MAX);
+}
+
+uint16_t potMean(uint16_t *lo = nullptr, uint16_t *hi = nullptr, int *n = nullptr) {
+  uint32_t now = micros(), sum = 0;
+  int k = 0;
+  uint16_t mn = 4095, mx = 0;
+  for (int i = 0; i < potCount; i++) {
+    int j = (potHead - 1 - i + POT_MAX) % POT_MAX;  // newest first
+    if (now - potT[j] > POT_WINDOW_US) break;
+    sum += potV[j];
+    mn = min(mn, potV[j]);
+    mx = max(mx, potV[j]);
+    k++;
+  }
+  if (lo) *lo = mn, *hi = mx, *n = k;
+  return k ? (sum + k / 2) / k : analogRead(ROLL_POT);
+}
+
+void potReport() {  // #pot: the window's readings oldest first, their spread and mean
+  uint16_t lo, hi;
+  int n;
+  uint16_t m = potMean(&lo, &hi, &n);
+  Serial.printf("pot: last %lu ms, %d readings, min %u, max %u (spread %.1f %% of the travel), mean %u (of 4095)\n"
+                "pot in order, about 1 ms apart:", (unsigned long)(POT_WINDOW_US / 1000), n, lo, hi,
+                (hi - lo) * 100.0f / 4095, m);
+  for (int i = n - 1; i >= 0; i--) Serial.printf(" %u", potV[(potHead - 1 - i + POT_MAX) % POT_MAX]);
+  Serial.println();
 }
 
 // The arm into the radio's state bytes, the layout masterLine() reads: per joint its raw angle, the pot 0..4095.
@@ -72,8 +106,7 @@ void readArm() {
     int raw = selectChannel(JOINT_CH[j]) ? readRaw() : -1;
     put16(lora.state + 2 * j, raw < 0 ? 0xFFFF : raw);
   }
-  put16(lora.state + 2 * NJ, potN ? (potSum + potN / 2) / potN : analogRead(ROLL_POT));
-  potSum = potN = 0;
+  put16(lora.state + 2 * NJ, potMean());
 }
 
 void scan() {  // #scan: which mux channels have an MT6701, for checking the wiring
@@ -139,6 +172,7 @@ void loop() {
     line[len] = 0;
     len = 0;
     if (!strcmp(line, "#scan")) scan();
+    else if (!strcmp(line, "#pot")) potReport();
     else if (line[0] && !lora.command(line, Serial)) lora.write(line);  // dropped while the radio link is down
   }
 }
