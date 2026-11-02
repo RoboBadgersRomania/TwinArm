@@ -55,13 +55,25 @@ int readRaw() {
   return hi << 6 | lo >> 2;
 }
 
+// The roll pot's wiper once a millisecond; readArm sends the mean since the last frame. A single analogRead
+// jitters by about 5 % of the travel (14 deg of wrist roll), 50 of them averaged by about a seventh of that.
+uint32_t potSum = 0, potN = 0;
+void samplePot() {
+  static uint32_t at = 0;
+  if (micros() - at < 1000) return;
+  at = micros();
+  potSum += analogRead(ROLL_POT);
+  potN++;
+}
+
 // The arm into the radio's state bytes, the layout masterLine() reads: per joint its raw angle, the pot 0..4095.
 void readArm() {
   for (int j = 0; j < NJ; j++) {
     int raw = selectChannel(JOINT_CH[j]) ? readRaw() : -1;
     put16(lora.state + 2 * j, raw < 0 ? 0xFFFF : raw);
   }
-  put16(lora.state + 2 * NJ, analogRead(ROLL_POT));
+  put16(lora.state + 2 * NJ, potN ? (potSum + potN / 2) / potN : analogRead(ROLL_POT));
+  potSum = potN = 0;
 }
 
 void scan() {  // #scan: which mux channels have an MT6701, for checking the wiring
@@ -101,6 +113,7 @@ void setup() {
 void loop() {
   lora.poll();
   readButton();
+  samplePot();
   static uint32_t readAt = 0, statAt = 0;
   char out[200];
   if (millis() - readAt >= 50) {

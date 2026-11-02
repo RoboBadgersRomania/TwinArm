@@ -28,6 +28,7 @@ jam_cfg = [4.0, 400]  # tolerance deg, time ms (0 = off)
 backup = {}           # the gateway's flash gain backup: id -> 4 gains
 rec = {"state": "idle", "no": 0, "take": [], "t0": 0.0, "speed": 1.0}  # the Teensy's recorder, at the 10 Hz tick
 takes = {}            # its SD card: number -> samples ({CAN id: target} every 0.1 s)
+mpc_state = {"models": {}}  # the Teensy's replay MPC (always on), state only: the sim's replay ignores it
 SIM_DROP_END = "--drop-end" in sys.argv  # lose every step test's end line, as a lossy WiFi might
 HIDDEN_CAP = {4: 15.0} if "--slow-roll" in sys.argv else {}  # deg/s the driver itself allows, whatever 'v' says
 MODEL = {}  # CAN id -> fitted real joint: kp, kv, vmax and the gains / speed limit it was measured with
@@ -98,6 +99,12 @@ def command(line):
     elif line in ("x", "h"):
         for m in motors.values():
             m.update(mode=0) if line == "x" else m.update(target=0.0, mode=4, jam=0, stuck=0.0)
+    elif line == "mpc" or line.startswith("mpc "):  # the Teensy's replay MPC: only its state here, not its effect
+        p = line.split()[1:]
+        if len(p) == 3 and 0.5 <= float(p[1]) <= 150 and 0.1 <= float(p[2]) <= 4:  # the Teensy's bounds
+            mpc_state["models"][int(p[0])] = (float(p[1]), float(p[2]))
+        sock.sendto(("Q,on,25.0,0,%s\n" % (",".join(
+            "%d:%.2f:%.2f" % (i, *mpc_state["models"].get(i, (0, 0))) for i in (1, 2, 3, 4)))).encode(), pc)
     elif line.startswith("t "):
         print("turret", line[2:])
     elif line.startswith("p "):

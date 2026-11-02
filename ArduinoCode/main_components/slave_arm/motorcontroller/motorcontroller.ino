@@ -20,6 +20,11 @@
 //   play <%>     replay the loaded take at this speed (10-200, 100 = as taught): a minimum-jerk move to its
 //                first pose, then the take, smoothed. A manual move (a r s h o t p x) or a jam stops it
 //   load <n>     load TAKEn from the card      takes   list the takes on the card
+// MPC for the replay, always on for joints with a model (JointMPC.h; the maths and a simulated comparison in
+// InterfaceApp/mpc.py). Models and lead are kept in EEPROM:
+//   mpc <id> <wn> <zeta>   the joint's model, from its step-test fit (the app sends model_fit.json)   mpc 2 14.9 0.52
+//   mpc lead <deg>         how far a setpoint may lead the take (default 25)      mpc test   self-test and timing
+//   mpc                    status:  Q,on,lead,slowest tick us,id:wn:zeta,...  (wn 0 = no model: plain replay)
 // The same commands arrive from the LightGateway on Serial2 (WiFi app), which gets one machine-readable
 // line per motor every TELEMETRY_MS:  T,id,ok,deg,target,amps,tempC,volts,busAmps,mode,fault,jammed
 // and the recorder's state:  R,idle|rec|move|play,take number (0 = not saved),seconds in,take seconds,sd ok
@@ -28,6 +33,8 @@
 //            then S,id,end  (or S,id,fail)
 // A joint that stops short of its target (see checkJam) holds where it stopped and ignores a/r until cleared.
 #include "GDZ.h"
+#include "JointMPC.h"
+#include <EEPROM.h>
 #include <Servo.h>
 #include <SD.h>
 
@@ -183,6 +190,111 @@ bool sdOk = false;
 
 bool replaying() { return rec == MOVING_IN || rec == PLAYING; }
 
+// ---------- MPC for the replay: always on ----------
+// Sees the take MPC_N ticks (0.5 s) ahead and sends setpoints that lead it, so the joints stop trailing the take
+// by their loop's lag. Every setpoint stays within the lead of what the plain replay would send. A joint replays
+// through the MPC once it has a model (mpc <id> <wn> <zeta>, from its step-test fit; the app sends them); the models
+// and the lead are kept in EEPROM, so a reboot keeps them. A joint without a model replays plainly.
+const int MPC_N = 25;
+static_assert(PLAY_MS == 20, "JointMPC::DT is the replay tick");
+JointMPC<MPC_N> mpc[MAX_ID + 1];
+uint32_t mpcUs = 0;                         // the slowest MPC tick of this replay: every joint's read, observe, solve
+const uint32_t MPC_MAGIC = 0x3143504D;      // "MPC1"
+struct MpcStore { uint32_t magic; float lead, wn[MAX_ID + 1], zeta[MAX_ID + 1]; };
+
+bool mpcValid(float wn, float z) {          // inside what JointMPC's 1 ms substeps integrate stably (kv h < 2)
+  return wn >= 0.5f && wn <= 150 && z >= 0.1f && z <= 4;
+}
+
+void mpcSave() {
+  MpcStore st = {MPC_MAGIC, mpc[1].lead, {}, {}};
+  for (uint8_t id : IDS) {
+    st.wn[id] = mpc[id].ready ? mpc[id].wn : 0;
+    st.zeta[id] = mpc[id].ready ? mpc[id].zeta : 0;
+  }
+  EEPROM.put(0, st);
+}
+
+void mpcLoad() {
+  MpcStore st;
+  EEPROM.get(0, st);
+  if (st.magic != MPC_MAGIC) {
+    Serial.println("mpc: no joint models stored yet (the app sends them)");
+    return;
+  }
+  for (uint8_t id : IDS) {
+    if (st.lead >= 2 && st.lead <= 40) mpc[id].lead = st.lead;
+    if (mpcValid(st.wn[id], st.zeta[id])) mpc[id].setModel(st.wn[id], st.zeta[id]);
+  }
+  Serial.print("mpc: models from EEPROM ");
+  for (uint8_t id : IDS) Serial.printf(" %d:%.2f:%.2f", id, mpc[id].ready ? mpc[id].wn : 0, mpc[id].ready ? mpc[id].zeta : 0);
+  Serial.println();
+}
+
+void mpcStart() {                           // the replay proper begins: each observer from where its joint is
+  mpcUs = 0;
+  for (uint8_t id : IDS) {
+    if (!mpc[id].ready) continue;
+    bool ok = bus.readPosition(id);
+    mpc[id].reset(ok ? bus.m[id].deg - zeroDeg[id] : target[id]);
+  }
+}
+
+void sampleAt(float pos, float *q);
+
+void mpcPose(float *q) {                    // q's CAN joints become the MPC's setpoints, on joints with a model
+  uint32_t t0 = micros();
+  static float ref[4][MPC_N];
+  float s[NV], ahead = PLAY_MS * playSpeed / TAKE_MS;  // take samples per tick
+  for (int k = 0; k < MPC_N; k++) {
+    sampleAt(min(playPos + (k + 1) * ahead, (float)(takeLen - 1)), s);
+    for (int i = 0; i < 4; i++) ref[i][k] = s[i];
+  }
+  for (int i = 0; i < 4; i++) {
+    uint8_t id = IDS[i];
+    if (!mpc[id].ready || jammed[id]) continue;
+    bool ok = bus.readPosition(id);
+    mpc[id].observe(ok ? bus.m[id].deg - zeroDeg[id] : 0, ok);
+    q[i] = mpc[id].step(ref[i]);
+  }
+  mpcUs = max(mpcUs, micros() - t0);
+}
+
+void mpcCommand(String a) {
+  a.trim();
+  int id;
+  float wn, z;
+  if (a.startsWith("lead ")) {
+    float l = a.substring(5).toFloat();
+    if (l >= 2 && l <= 40) {
+      for (auto &m : mpc) m.lead = l;
+      mpcSave();
+    }
+  } else if (a == "test") {
+    uint32_t us;
+    bool ok = JointMPC<MPC_N>::selfTest(Serial, us);
+    gateway.printf("Q,test,%d,%lu\n", ok, (unsigned long)us);
+    return;
+  } else if (sscanf(a.c_str(), "%d %f %f", &id, &wn, &z) == 3 && id >= 1 && id <= MAX_ID) {
+    if (!mpcValid(wn, z)) {
+      Serial.printf("mpc: motor %d model wn %.2f zeta %.2f refused (wn 0.5-150, zeta 0.1-4)\n", id, wn, z);
+    } else if (!mpc[id].ready || fabsf(mpc[id].wn - wn) > 1e-3f || fabsf(mpc[id].zeta - z) > 1e-3f) {
+      mpc[id].setModel(wn, z);
+      if (rec == PLAYING) mpc[id].reset(target[id]);
+      mpcSave();
+    }
+  } else if (a.length()) {
+    Serial.println("mpc: <id> <wn> <zeta> | lead <deg> | test");
+  }
+  char line[160];
+  int n = snprintf(line, sizeof line, "Q,on,%.1f,%lu", mpc[1].lead, (unsigned long)mpcUs);
+  for (uint8_t i : IDS)
+    n += snprintf(line + n, sizeof line - n, ",%d:%.2f:%.2f", i, mpc[i].ready ? mpc[i].wn : 0, mpc[i].ready ? mpc[i].zeta : 0);
+  gateway.println(line);
+  Serial.printf("mpc: lead %.1f deg, slowest tick %lu us; models (id:wn:zeta) %s\n", mpc[1].lead,
+                (unsigned long)mpcUs, line + 5);
+}
+
 void say(const char *msg) { Serial.printf("take: %s\n", msg); }
 
 // The take at sample position pos, smoothed by a centred moving average (zero phase, so no lag) over +-50 ms,
@@ -201,15 +313,17 @@ void sampleAt(float pos, float *q) {
   }
 }
 
-void applyPose(const float *q) {            // the replay drives the arm as the app's a / t / p commands would
+// The replay drives the arm as the app's a / t / p commands would. u: the setpoints sent (the MPC's, or the take's),
+// ref: the take, reported as the target, so telemetry and jam detection measure against the take in both modes.
+void applyPose(const float *u, const float *ref) {
   for (int i = 0; i < 4; i++) {
     uint8_t id = IDS[i];
     if (jammed[id]) continue;
-    target[id] = q[i];
-    bus.moveTo(id, zeroDeg[id] + q[i]);
+    target[id] = ref[i];
+    bus.moveTo(id, zeroDeg[id] + u[i]);
   }
-  turn(q[4]);
-  openTo(q[5]);
+  turn(u[4]);
+  openTo(u[5]);
 }
 
 bool saveTake() {
@@ -266,7 +380,11 @@ void stopTake() {                           // ends a recording (and saves it) o
     Serial.printf("take: recorded %.1f s, %s\n", takeLen * TAKE_MS / 1000.0f,
                   saved ? "saved on the card" : sdOk ? "SAVING FAILED, kept in RAM" : "no card, kept in RAM");
   } else if (replaying()) {
+    bool viaMpc = rec == PLAYING;
     rec = IDLE;
+    if (viaMpc)  // an MPC setpoint can lead the take by up to the lead: hold on the take, as a plain replay would
+      for (uint8_t id : IDS)
+        if (mpc[id].ready && !jammed[id]) bus.moveTo(id, zeroDeg[id] + target[id]);
     say("replay stopped, holding");
   }
 }
@@ -321,6 +439,7 @@ void takeTick() {
   for (uint8_t id : IDS)
     if (jammed[id]) return stopTake();      // something is in the way
   float q[NV];
+  bool viaMpc = false;
   if (rec == MOVING_IN) {
     float first[NV], s = minJerk(recClock / (float)moveInMs);
     sampleAt(0, first);
@@ -328,6 +447,7 @@ void takeTick() {
     if (recClock >= moveInMs) {
       rec = PLAYING;
       recClock = 0;
+      mpcStart();
     }
   } else {
     playPos = recClock * playSpeed / TAKE_MS;  // from the clock, so a slow loop does not stretch the take
@@ -337,8 +457,12 @@ void takeTick() {
       say("replay done");
     }
     sampleAt(playPos, q);
+    viaMpc = rec == PLAYING;                // the last pose goes out plain, so the arm ends where the take does
   }
-  applyPose(q);
+  float u[NV];
+  memcpy(u, q, sizeof u);
+  if (viaMpc) mpcPose(u);                   // the drivers get the MPC's setpoints; q stays the take
+  applyPose(u, q);
 }
 
 void setup() {
@@ -351,6 +475,7 @@ void setup() {
   grip(GRIPPER_MID_US);
   turret.attach(TURRET_PIN);
   turn(0);
+  mpcLoad();
   sdOk = SD.begin(BUILTIN_SDCARD);
   Serial.printf("SD card: %s\n", sdOk ? "ok, takes are saved there" : "NOT FOUND, takes only live in RAM");
   bus.begin(CAN_BAUD);
@@ -378,6 +503,7 @@ void command(String s, bool echo) {
     return;
   }
   if (s == "takes") return listTakes();
+  if (s == "mpc" || s.startsWith("mpc ")) return mpcCommand(s.substring(3));
   int id; char op; float v = 0;
   bool joint = sscanf(s.c_str(), "%d %c%f", &id, &op, &v) >= 2;
   if (replaying() && (s.startsWith("t ") || s.startsWith("p ") || s == "x" || s == "h" ||
