@@ -10,7 +10,10 @@ PC -> Teensy   "1 a12.50", "t -30", "x"  motorcontroller.ino console commands, s
 Teensy -> PC   T,id,ok,deg,target,amps,tempC,volts,busAmps,mode,fault,jammed   one line per motor every 100 ms
                P,id,ok,posKp,posKi,velKp,velKi   answer to "<id> g ..."     J,deg,ms   answer to "j ..."
                S,id,begin,start,target,sampleMs / S,id,i,deg,deg,... / S,id,end   step test curve, answer to "<id> s<deg>"
-gateway -> PC  M,j1,j2,j3,gripPot%,turretPot%,okBits   the master arm 20 times a second: joints 0..360 deg, -1 no reading
+               R,idle|rec|move|play,take,secondsIn,takeSeconds,sdOk   the Teensy's recorder, with every telemetry sweep
+               K,n,seconds ... K,end,count   the takes on the Teensy's SD card, answer to "takes"
+gateway -> PC  M,turret,shoulder,elbow,wristPitch,rollPot%,gripClosed,okBits   the master arm 20 times a second:
+               joints 0..360 deg (-1 no reading), the wrist-roll pot 0..100 %, the gripper button's state (1 closed)
                L,m|f,state,slots/s,ok%,rssi,snr,peerRssi,peerSnr,MHz   the radio once a second, seen from the master (m)
                or the follower (f); state -2 no radio, -1 no key, 0 searching, 1 up
 """
@@ -55,6 +58,7 @@ class Link:
         self.sock, self.addr = None, None
         self.ser, self.rx = None, b""        # serial port to the master's gateway, and a line not finished yet
         self.master, self.radio = None, None  # last M and L lines, parsed, with their arrival time
+        self.take, self.takes = None, {}     # the Teensy's recorder (last R line); takes on its card: number -> s
         self.motors = {i: Motor(history) for i in ids}
         self.gw_seen, self.rtt, self.rssi = 0.0, None, 0
         self.lines = deque(maxlen=200)       # arrival times of T lines, for the rate
@@ -165,10 +169,15 @@ class Link:
                     for k, v in enumerate(f[3:]):  # by index: datagrams may arrive out of order, or not at all
                         cap["samples"][int(f[2]) + k] = float(v)
                     cap["last"] = t
-            elif f[0] == "M" and len(f) == 7:
-                ok = int(f[6])
-                self.master = {"deg": [float(v) for v in f[1:4]], "ok": [bool(ok >> j & 1) for j in range(3)],
-                               "pots": [float(f[4]), float(f[5])], "seen": t}
+            elif f[0] == "M" and len(f) == 8:
+                ok = int(f[7])
+                self.master = {"deg": [float(v) for v in f[1:5]], "ok": [bool(ok >> j & 1) for j in range(4)],
+                               "roll": float(f[5]), "grip": f[6] == "1", "seen": t}
+            elif f[0] == "R" and len(f) == 6:
+                self.take = {"state": f[1], "no": int(f[2]), "at": float(f[3]), "len": float(f[4]), "sd": f[5] == "1",
+                             "seen": t}
+            elif f[0] == "K" and len(f) == 3 and f[1] != "end":
+                self.takes[int(f[1])] = float(f[2])
             elif f[0] == "L" and len(f) == 10:
                 self.radio = {"role": f[1], "state": int(f[2]), "rate": int(f[3]), "ok": int(f[4]), "rssi": float(f[5]),
                               "snr": float(f[6]), "peer_rssi": float(f[7]), "peer_snr": float(f[8]), "mhz": float(f[9]),
@@ -178,6 +187,10 @@ class Link:
 
     def master_online(self):
         return self.master is not None and time.monotonic() - self.master["seen"] < 0.5
+
+    def recorder(self):
+        """The last R line while it is fresh (the Teensy sends one every 100 ms), else None."""
+        return self.take if self.take and time.monotonic() - self.take["seen"] < 1.5 else None
 
     def radio_status(self):
         """The last L line while it is fresh, else None."""
@@ -225,10 +238,14 @@ if __name__ == "__main__":
     time.sleep(0.05)
     link.poll()
     assert link.backup == {1: (20, 0, 8, 0.1)} and link.backup_end[0] == 1
-    link.feed(b"M,12.50,-1,300.25,48.2,51.0,5\r\nL,m,1,31,97,-42,9.5,-45,8.8,433.70\nT,1,1,1", time.monotonic())
-    assert link.master_online() and link.master["ok"] == [True, False, True] and link.master["deg"][2] == 300.25
-    assert link.master["pots"] == [48.2, 51.0] and link.radio_status()["state"] == 1 and link.radio["mhz"] == 433.7
+    link.feed(b"M,12.50,-1,300.25,90.00,48.2,1,13\r\nL,m,1,31,97,-42,9.5,-45,8.8,433.70\nT,1,1,1", time.monotonic())
+    assert link.master_online() and link.master["ok"] == [True, False, True, True] and link.master["deg"][2] == 300.25
+    assert link.master["roll"] == 48.2 and link.master["grip"] and link.radio_status()["state"] == 1
+    assert link.radio["mhz"] == 433.7
     assert link.rx == b"T,1,1,1"  # the unfinished line waits for the rest
     link.feed(b",12.50,15.00,0.520,38,24.10,0.31,4,5,0\n", time.monotonic())
     assert link.rx == b"" and link.motors[1].deg == 12.5 and is_serial("COM13") and not is_serial("192.168.4.1")
+    link.feed(b"R,play,3,4.20,12.30,1\nK,1,5.00\nK,3,12.30\nK,end,2\n", time.monotonic())
+    assert link.recorder() == dict(link.take, state="play", no=3, at=4.2, len=12.3, sd=True)
+    assert link.takes == {1: 5.0, 3: 12.3}
     print("link ok")

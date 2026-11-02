@@ -43,7 +43,10 @@ DEFAULTS = {
     "zero1": 80, "zero2": -132, "zero3": 52,    # joint angles as drawn at the arm zero (the idle pose photo)
     "sign1": -1, "sign2": 1, "sign3": -1, "sign4": -1, "sign_t": 1,  # motor direction against the drawing (checked on the arm)
     "sign_g": -1,                               # gripper: on the real one the 1350 us end opens it, so "p" runs reversed
-    "sign_pg": 1, "sign_pt": 1,                 # master arm pots (gripper, turret) against the follower, LoRa Master tab
+    "sign_pr": 1,                               # master's wrist-roll pot against the follower's roll, LoRa Master tab
+    "master_zero": [310.69, 109.58, 123.53, 345.43],  # master turret, shoulder, elbow, wrist pitch at the follower's idle
+    "roll_zero": 21.2,                          # master's roll pot (%) at the follower's idle
+    "mdir": [1, 1, -1, 1],                      # master joint direction against the drawing (Normal / Inverted)
     "table": 110,                               # mm from the shoulder axis down to the table: tip never goes below
     "limit": 150, "turret_limit": 90,           # +- degrees from the arm zero
     "turret_rate": 60,                          # deg/s at 100 % while A/D is held (W/S runs at the joint speed)
@@ -77,7 +80,9 @@ ROWS = [  # label, key[, step, min, max]; no step = toggle, key None = section t
     ("Graph window (s)", "window", 5, 5, 120), ("Mirror view (arm faces left)", "mirror"),
 ]
 GAIN_NAMES = ("Position Kp", "Position Ki", "Velocity Kp", "Velocity Ki")  # tune.py's gain index order
-CALIBRATION = {"zero1", "zero2", "zero3", "sign1", "sign2", "sign3", "sign4", "sign_t", "sign_g", "sign_pg", "sign_pt"}
+CALIBRATION = {"zero1", "zero2", "zero3", "sign1", "sign2", "sign3", "sign4", "sign_t", "sign_g", "sign_pr"}
+MASTER_JOINTS = (("Turret", 0), ("Shoulder", 1), ("Elbow", 2), ("Wrist pitch", 4))  # the master's MT6701s, mux channel
+ROLL_POT_TRAVEL = 270  # degrees the master's roll pot turns end to end (its reading at idle is the roll zero)
 
 
 def load():
@@ -183,7 +188,8 @@ class App:
         self.cfg = load()
         self.link = Link([j[1] for j in JOINTS])
         self.fields = {"host": host or self.cfg["host"], "port": str(self.cfg["port"]), "speed": str(self.cfg["speed"]),
-                       "jam_err": "%g" % self.cfg["jam_err"], "jam_ms": str(self.cfg["jam_ms"])}
+                       "jam_err": "%g" % self.cfg["jam_err"], "jam_ms": str(self.cfg["jam_ms"]),
+                       "rspeed": "100"}  # replay speed, %
         for _, cid, _ in JOINTS:  # Configuration tab: last values typed, until the drivers are read
             for k, v in enumerate(self.cfg["tuning"].get(str(cid), [""] * 5)):
                 self.fields["t%d_%d" % (cid, k)] = v
@@ -208,6 +214,7 @@ class App:
         self.sent, self.full_at = {}, 0.0
         self.tick_at = self.hello_at = time.monotonic()
         self.toast_msg, self.toast_at, self.release_armed = "", 0.0, 0.0
+        self.idle_armed = 0.0           # first click of Set idle from master
         self.hits, self.view, self.tip_px, self.cursor, self.layer = [], (0, 0, 1, 1), None, None, None
         self.card_pick = {}             # chosen spot per info card, kept while it stays clear
         self.ports, self.ports_at = [], 0.0  # USB serial ports seen, for the Connection panel
@@ -234,17 +241,34 @@ class App:
         return p if self.cfg["sign_g"] > 0 else 100 - p
 
     def following(self):
-        return self.follow and self.link.master_online()
+        """The follower copies the master: always over the radio, with the Follow switch over WiFi."""
+        return (self.follow or self.link.ser is not None) and self.link.master_online()
 
-    def pot_grip(self):
-        """% open the master's gripper pot asks for."""
-        p = self.link.master["pots"][0]
-        return p if self.cfg["sign_pg"] > 0 else 100 - p
+    def master_grip(self):
+        """% open the master's gripper button asks for: each press closes or opens it fully."""
+        return 0.0 if self.link.master["grip"] else 100.0
 
-    def pot_turret(self):
-        """Turret angle the master's turret pot asks for: its travel spans the turret limits."""
-        tl = self.cfg["turret_limit"]
-        return clamp(self.cfg["sign_pt"] * (self.link.master["pots"][1] / 50 - 1) * tl, -tl, tl)
+    def pot_roll(self):
+        """Wrist roll the master's roll pot asks for, degree for degree from its idle reading, inside the joint limit."""
+        lim = self.cfg["limit"]
+        turn = (self.link.master["roll"] - self.cfg["roll_zero"]) / 100 * ROLL_POT_TRAVEL
+        return clamp(self.cfg["sign_pr"] * turn, -lim, lim)
+
+    def master_offset(self, j):
+        """Master joint j (turret, shoulder, elbow, wrist pitch) from its idle reading, in the drawing's direction:
+        the follower's angle from its arm zero. None without a reading."""
+        ms = self.link.master
+        if not ms["ok"][j]:
+            return None
+        return self.cfg["mdir"][j] * wrap(ms["deg"][j] - self.cfg["master_zero"][j])
+
+    def master_pose(self):
+        """The follower's side-view joints (as drawn) the master's pose asks for; None while one has no reading."""
+        offs = [self.master_offset(j) for j in (1, 2, 3)]
+        if None in offs:
+            return None
+        lim = self.cfg["limit"]
+        return [z + clamp(o, -lim, lim) for z, o in zip(self.zero(), offs)]
 
     def measured(self):
         if not self.link.robot_online():
@@ -268,9 +292,15 @@ class App:
         if on and not self.link.robot_online():
             self.toast("No telemetry from the arm: connect first")
             return
+        if on and self.link.ser and not self.link.master_online():  # over the radio the master is the controller
+            self.toast("No readings from the master arm: check its gateway")
+            return
         if on and self.jams:
             self.toast("A joint is jammed: free it, then Clear jam")
             return
+        tk = self.link.recorder()
+        if not on and self.control and tk and tk["state"] == "rec":  # the take ends where the operator lets go
+            self.link.send("stop")
         self.control, self.drag = on, False
         if on:  # start from where the arm is, so nothing jumps
             self.g = self.measured()
@@ -296,7 +326,7 @@ class App:
             self.set_control(False, "Telemetry lost: control OFF, the arm holds its last target")
             return
         fol = self.following()
-        if self.focus is None:
+        if self.focus is None and self.link.ser is None:  # over the radio the master drives, not the keys
             k = pygame.key.get_pressed()
             tl = self.cfg["turret_limit"]
             pct = self.cfg["speed"] / 100
@@ -305,12 +335,12 @@ class App:
                                     -tl, tl)
             # deg/s = the speed limit each driver got, so the target never runs ahead of the motor
             turn = k[pygame.K_q] - k[pygame.K_e]  # Q left, E right, like A/D
-            if turn:  # the target leads the real roll by 15 deg at most, so it stops soon after the key is let go
+            if turn and not fol:  # the target leads the real roll by 15 deg at most, so it stops soon after letting go
                 real = self.cfg["sign4"] * self.link.motors[JOINTS[3][1]].deg
                 self.roll = clamp(clamp(self.roll + turn * self.cfg["roll_dps"] * dt, real - 15, real + 15),
                                   -self.cfg["limit"], self.cfg["limit"])
             step = (k[pygame.K_w] - k[pygame.K_s]) * self.rpm(JOINTS[2][1]) * 6 * dt  # W tilts the tool up
-            if step:
+            if step and not fol:
                 z, lim = self.zero()[2], self.cfg["limit"]
                 g = [self.g[0], self.g[1], z + clamp(self.g[2] + step - z, -lim, lim)]
                 if min(p[1] for p in fk(g, self.lengths())[1:]) >= 15 - self.cfg["table"]:  # not into the table
@@ -318,8 +348,14 @@ class App:
             ctrl = k[pygame.K_LCTRL] or k[pygame.K_RCTRL]
             if not fol:
                 self.grip = clamp(self.grip + (ctrl - k[pygame.K_SPACE]) * self.cfg["grip_rate"] * dt, 0, 100)
-        if fol:  # joints follow too once the master's angles are matched to the follower's
-            self.grip, self.turret = self.pot_grip(), self.pot_turret()
+        if fol:  # a copy of the master: encoders -> joints and turret, roll pot -> wrist roll, button -> gripper
+            g = self.master_pose()
+            if g and min(p[1] for p in fk(g, self.lengths())[1:]) >= 15 - self.cfg["table"]:  # not into the table
+                self.g, self.tool = g, sum(g)
+            t, tl = self.master_offset(0), self.cfg["turret_limit"]
+            if t is not None:
+                self.turret = clamp(t, -tl, tl)
+            self.grip, self.roll = self.master_grip(), self.pot_roll()
         targets = {JOINTS[i][1]: self.motor(i, self.g[i]) for i in range(3)}
         targets[JOINTS[3][1]] = self.cfg["sign4"] * self.roll
         targets["t"] = self.cfg["sign_t"] * self.turret
@@ -407,6 +443,9 @@ class App:
 
     def idle(self):
         """Back to the pose homing found: 0 is the arm zero the Teensy stored, so no re-homing."""
+        if self.control and self.following():
+            self.toast("The follower copies the master: Control OFF first, or put the master in its idle pose")
+            return
         self.turret = self.roll = 0.0
         self.grip = self.grip_from(GRIP_IDLE)
         if self.control:  # move the commanded pose, the control loop sends it
@@ -631,6 +670,42 @@ class App:
         self.tab = i
         if i == 1 and self.link.robot_online():
             self.read_tuning()
+        if i == 2:
+            self.refresh_takes()
+
+    # ---------- teach and replay: the Teensy records and replays, the app starts and stops it ----------
+
+    def record(self):
+        if not self.link.recorder():
+            self.toast("No recorder on the Teensy: connect, and flash the latest motorcontroller.ino")
+        elif not self.control:
+            self.toast("Control ON first: a take is what the follower is told while you drive it")
+        else:
+            self.link.send("rec")
+            self.toast("Recording: drive the arm, then Stop (or Control OFF)")
+
+    def stop_take(self):
+        self.link.send("stop")
+
+    def play_take(self):
+        tk = self.link.recorder()
+        if not tk or not tk["len"]:
+            self.toast("No take to play: record one, or load one from the card")
+            return
+        s = self.fields["rspeed"].strip()
+        pct = int(clamp(int(s), 10, 200)) if s.isdigit() else 100
+        self.fields["rspeed"] = str(pct)
+        if self.control:
+            self.set_control(False, "Control OFF: the Teensy replays the take on its own")
+        self.link.send(*self.speed_lines() + ["play %d" % pct])  # the joints' speed limits, as Speed % sets them
+        self.toast("Replaying at %d %%: a smooth move to the first pose, then the take. Control ON takes over" % pct)
+
+    def load_take(self, n):
+        self.link.send("load %d" % n)
+
+    def refresh_takes(self):
+        self.link.takes.clear()  # the answer lists them all again; a take deleted from the card disappears
+        self.link.send("takes")
 
     def clear_faults(self):
         self.link.send(*("%d c" % j[1] for j in JOINTS))  # clears driver faults and jams
@@ -668,10 +743,42 @@ class App:
         self.fields["speed"] = str(self.cfg["speed"])
         save(self.cfg)
 
+    def capture_idle(self):
+        """The master's pose now is the follower's idle (arm zero): its readings become the zero. Two clicks."""
+        ms = self.link.master if self.link.master_online() else None
+        if not ms:
+            self.toast("No master readings: connect first")
+            return
+        missing = [MASTER_JOINTS[j][0] for j in range(4) if not ms["ok"][j]]
+        if missing:
+            self.toast("No reading from the %s: fix it first" % ", ".join(missing).lower())
+            return
+        if time.monotonic() - self.idle_armed > 2:
+            self.idle_armed = time.monotonic()
+            self.toast("Click again within 2 s: the master's pose now becomes the follower's idle")
+            return
+        self.idle_armed = 0.0
+        if self.control:
+            self.set_control(False, "Control OFF: idle set from the master")
+        self.cfg["master_zero"] = [round(d, 2) for d in ms["deg"]]
+        self.cfg["roll_zero"] = round(ms["roll"], 1)
+        save(self.cfg)
+        self.toast("Idle set: turret %.2f°, shoulder %.2f°, elbow %.2f°, wrist %.2f°, roll pot %.1f %%"
+                   % tuple(self.cfg["master_zero"] + [self.cfg["roll_zero"]]))
+
+    def flip_mdir(self, j):
+        if self.control:
+            self.set_control(False, "Control OFF: calibration changed")
+        self.cfg["mdir"] = [-d if k == j else d for k, d in enumerate(self.cfg["mdir"])]
+        save(self.cfg)
+
     def toggle_follow(self):
+        if self.link.ser:
+            self.toast("Over the radio the follower always copies the master")
+            return
         self.follow = not self.follow
-        self.toast("Follow ON: with Control ON the master's pots drive the gripper and turret" if self.follow
-                   else "Follow OFF: Space / Ctrl and A / D drive the gripper and turret again")
+        self.toast("Follow ON: with Control ON the follower copies the master" if self.follow
+                   else "Follow OFF: the mouse and keys drive the follower again")
 
     def toggle_panel(self, name):
         self.panel = None if self.panel == name else name
@@ -699,13 +806,15 @@ class App:
         elif e.type == pygame.MOUSEMOTION and self.drag:
             self.drag_mm = self.to_mm(e.pos)
             self.solve(self.drag_mm)
-        elif e.type == pygame.MOUSEWHEEL and self.control and self.tab == 0:
+        elif e.type == pygame.MOUSEWHEEL and self.control and self.tab == 0 and self.link.ser is None:
             self.tool = wrap(self.tool + 3 * e.y)
             self.solve(self.drag_mm if self.drag else fk(self.g, self.lengths())[-1])
         elif e.type == pygame.TEXTINPUT and self.focus:
-            ok = "0123456789" if self.focus in ("port", "speed") else None if self.focus == "host" else "0123456789.-"
+            digits = self.focus in ("port", "speed", "rspeed")
+            ok = "0123456789" if digits else None if self.focus == "host" else "0123456789.-"
             if ok is None or all(ch in ok for ch in e.text):
-                self.fields[self.focus] = (self.fields[self.focus] + e.text)[:{"speed": 3, "host": 64}.get(self.focus, 12)]
+                cap = {"speed": 3, "rspeed": 3, "host": 64}.get(self.focus, 12)
+                self.fields[self.focus] = (self.fields[self.focus] + e.text)[:cap]
         elif e.type == pygame.KEYDOWN:
             self.key(e.key)
 
@@ -839,7 +948,7 @@ class App:
         surf.fill(BG)
         content = pygame.Rect(0, TOP, W - SIDE, H - TOP)
         self.tip_px = None  # only the Manual tab has a tip to drag
-        (self.draw_config if self.tab == 1 else self.draw_master if self.tab == 3 else self.draw_manual)(surf, content)
+        (self.draw_manual, self.draw_config, self.draw_replay, self.draw_master)[self.tab](surf, content)
         self.draw_sidebar(surf, pygame.Rect(W - SIDE, TOP, SIDE, H - TOP))
         self.draw_top(surf, W)
         if self.panel == "conn":
@@ -875,7 +984,7 @@ class App:
         pygame.draw.line(surf, LINE, r.topleft, r.bottomleft)
         tabs = [("Manual", "Telemetry", icon_remote, None),
                 ("Config", "& tuning", icon_tune, None),
-                ("Teach &", "Replay", icon_replay, "Teach & Replay comes with the recording firmware"),
+                ("Teach &", "Replay", icon_replay, None),
                 ("LoRa", "Master", icon_antenna, None)]
         for i, (l1, l2, icon, later) in enumerate(tabs):
             t = pygame.Rect(r.x + 8, r.y + 12 + i * 96, r.w - 16, 86)
@@ -891,9 +1000,13 @@ class App:
 
     def draw_manual(self, surf, c):
         text(surf, "Manual Wireless Telemetry", (c.x + 18, c.y + 12), 20, BEIGE, True)
-        text(surf, "Control ON, then drag the red tip  ·  wheel: tool angle  ·  A / D: turret  ·  W / S: wrist pitch"
-                   "  ·  Q / E: wrist roll"
-                   "  ·  Space / Ctrl: close / open gripper  ·  I: idle  ·  Esc: control off", (c.x + 18, c.y + 40), 12, MUTED)
+        if self.link.ser:  # the radio link: the master arm is the controller
+            hint = ("Over the radio the follower copies the master arm (amber)  ·  Control ON to start, at the Speed % below"
+                    "  ·  Esc: control off")
+        else:
+            hint = ("Control ON, then drag the red tip  ·  wheel: tool angle  ·  A / D: turret  ·  W / S: wrist pitch"
+                    "  ·  Q / E: wrist roll  ·  Space / Ctrl: close / open gripper  ·  I: idle  ·  Esc: control off")
+        text(surf, hint, (c.x + 18, c.y + 40), 12, MUTED)
         body = pygame.Rect(c.x + 16, c.y + 64, c.w - 32, c.h - 80)
         gw = max(320, int(body.w * 0.34))
         self.draw_arm(surf, pygame.Rect(body.x, body.y, body.w - gw - 14, body.h))
@@ -932,6 +1045,9 @@ class App:
         else:  # idle: follows the telemetry and breathes
             pose = meas or self.zero()
             self.draw_pose(self.layer, area.topleft, pose, BEIGE, int(120 + 60 * math.sin(time.monotonic() * 2.2)))
+        ghost = self.master_pose() if self.link.master_online() else None
+        if ghost:  # where Follow master would send the arm: check the directions with this before Control ON
+            self.draw_pose(self.layer, area.topleft, ghost, AMBER, 90)
         surf.blit(self.layer, area.topleft)
 
         pts = [self.to_screen(p) for p in fk(pose, L)]
@@ -942,8 +1058,9 @@ class App:
         for i, (_, cid, _) in enumerate(JOINTS):  # wrist roll pulses at the tip
             if cid in self.jams:
                 self.draw_jam(surf, pts[i])
-        tip = self.tip_px = pts[3]
-        if self.control:
+        tip = pts[3]
+        self.tip_px = tip if self.link.ser is None else None  # over the radio there is no tip to drag
+        if self.control and self.tip_px:
             if self.drag and self.drag_mm:
                 q = self.to_screen(self.drag_mm)
                 if math.dist(q, tip) > 4:
@@ -993,6 +1110,13 @@ class App:
         x += 122
         armed = time.monotonic() - self.release_armed < 2
         self.button(surf, pygame.Rect(x, y, 146, h), "Click to confirm" if armed else "Release motors", self.release, "danger")
+        tk = self.link.recorder()
+        if tk and tk["state"] != "idle":  # the Teensy is recording or replaying
+            rec = tk["state"] == "rec"
+            cx, cy = x + 146 + 26, y + h // 2
+            pygame.draw.circle(surf, RED_HI if rec else GREEN, (cx, cy), 7)
+            text(surf, "REC %.1f s" % tk["at"] if rec else "REPLAY %.1f / %.1f s" % (tk["at"], tk["len"]),
+                 (cx + 14, cy), 13, RED_HI if rec else GREEN, True, "midleft")
         sf = pygame.Rect(bar.right - 14 - 76, y, 76, h)  # Speed %, 1-100: Enter or click away applies it
         self.field(surf, sf, "speed")
         text(surf, "%", (sf.right - 12, sf.centery), 15, MUTED, anchor="midright")
@@ -1008,10 +1132,83 @@ class App:
         self.draw_tuning(surf, pygame.Rect(body.x, body.y, body.w - rw - 14, body.h))
         self.draw_step(surf, pygame.Rect(body.right - rw, body.y, rw, body.h))
 
+    def draw_replay(self, surf, c):
+        text(surf, "Teach & Replay", (c.x + 18, c.y + 12), 20, BEIGE, True)
+        text(surf, "The Teensy records what the follower is told and replays it by itself, from its SD card: a replay "
+                   "keeps going without the PC or the link", (c.x + 18, c.y + 40), 12, MUTED)
+        body = pygame.Rect(c.x + 16, c.y + 64, c.w - 32, c.h - 80)
+        rw = max(340, int(body.w * 0.3))
+        self.draw_recorder(surf, pygame.Rect(body.x, body.y, body.w - rw - 14, body.h))
+        self.draw_takes(surf, pygame.Rect(body.right - rw, body.y, rw, body.h))
+
+    def draw_recorder(self, surf, r):
+        pygame.draw.rect(surf, PANEL, r, border_radius=14)
+        tk = self.link.recorder()
+        text(surf, "Recorder", (r.x + 18, r.y + 14), 15, BEIGE, True)
+        y = r.y + 54
+        if not tk:
+            text(surf, "No recorder state from the Teensy" if self.connected else "Not connected", (r.x + 18, y), 18,
+                 MUTED, True)
+            text(surf, "Connect, and flash the latest motorcontroller.ino on the Teensy", (r.x + 18, y + 30), 13, MUTED)
+        else:
+            st = tk["state"]
+            loaded = ("take %d" % tk["no"] if tk["no"] else "a take not saved") if tk["len"] else ""
+            head, col = {"rec": ("Recording  %.1f s" % tk["at"], RED_HI),
+                         "move": ("Moving to the first pose of %s" % loaded, AMBER),
+                         "play": ("Replaying %s  %.1f / %.1f s" % (loaded, tk["at"], tk["len"]), GREEN)}.get(
+                st, ("Ready · %s, %.1f s" % (loaded, tk["len"]) if loaded else "Ready · no take yet", BEIGE))
+            if st == "rec":
+                pygame.draw.circle(surf, RED_HI, (r.x + 28, y + 12), 8)
+            text(surf, head, (r.x + (46 if st == "rec" else 18), y), 20, col, True)
+            bar = pygame.Rect(r.x + 18, y + 40, r.w - 36, 8)
+            pygame.draw.rect(surf, PANEL2, bar, border_radius=4)
+            if st == "play" and tk["len"]:
+                pygame.draw.rect(surf, GREEN, (bar.x, bar.y, bar.w * min(1, tk["at"] / tk["len"]), bar.h), border_radius=4)
+            text(surf, "SD card ok: every take is saved on it" if tk["sd"] else
+                 "No SD card in the Teensy: a take lives in RAM until power-off", (r.x + 18, y + 58), 12,
+                 MUTED if tk["sd"] else AMBER)
+        y += 96
+        x, h = r.x + 18, 44
+        self.button(surf, pygame.Rect(x, y, 140, h), "Record", self.record, "on" if tk and tk["state"] == "rec" else "plain",
+                    15, True)
+        self.button(surf, pygame.Rect(x + 150, y, 120, h), "Stop", self.stop_take, size=15, bold=True)
+        self.button(surf, pygame.Rect(x + 280, y, 120, h), "Play", self.play_take,
+                    "on" if tk and tk["state"] in ("move", "play") else "plain", 15, True)
+        sf = pygame.Rect(x + 410 + 64, y, 76, h)
+        text(surf, "at", (sf.x - 10, sf.centery), 13, BEIGE, True, "midright")
+        self.field(surf, sf, "rspeed")
+        text(surf, "%", (sf.right - 12, sf.centery), 15, MUTED, anchor="midright")
+        y += h + 28
+        for note in ("1  Control ON and drive the follower: with the master over the radio, or by dragging over WiFi.",
+                     "2  Record, move, then Stop (Control OFF stops it too). The take is saved on the card as TAKEnnn, "
+                     "100 samples a second, up to 5 minutes.",
+                     "3  Play at a speed from 10 to 200 %. Control turns OFF, the follower moves smoothly (minimum jerk) "
+                     "to the take's first pose, then replays it, smoothed. Control ON, any manual move or a jam stops it."):
+            for ln in wrap_text(note, 13, r.w - 36):
+                text(surf, ln, (r.x + 18, y), 13, MUTED)
+                y += 19
+            y += 8
+
+    def draw_takes(self, surf, r):
+        pygame.draw.rect(surf, PANEL, r, border_radius=14)
+        text(surf, "Takes on the card", (r.x + 18, r.y + 14), 15, BEIGE, True)
+        self.button(surf, pygame.Rect(r.right - 18 - 90, r.y + 10, 90, 28), "Refresh", self.refresh_takes, size=12)
+        tk = self.link.recorder()
+        y = r.y + 54
+        if not self.link.takes:
+            text(surf, "None yet" if tk else "–", (r.x + 18, y), 13, MUTED)
+        for n, secs in sorted(self.link.takes.items())[-20:]:  # the newest 20
+            on = tk and tk["no"] == n
+            text(surf, "Take %d" % n, (r.x + 18, y + 6), 14, GREEN if on else BEIGE, True)
+            text(surf, "%.1f s%s" % (secs, "  · loaded" if on else ""), (r.x + 110, y + 7), 13, MUTED)
+            self.button(surf, pygame.Rect(r.right - 18 - 80, y, 80, 28), "Load", lambda n=n: self.load_take(n),
+                        "on" if on else "plain", 12)
+            y += 36
+
     def draw_master(self, surf, c):
         text(surf, "LoRa Master", (c.x + 18, c.y + 12), 20, BEIGE, True)
-        text(surf, "The master arm and its encrypted, frequency-hopping 433 MHz link to the follower  ·  the joints "
-                   "follow once their angles are matched to the follower's", (c.x + 18, c.y + 40), 12, MUTED)
+        text(surf, "The master arm and its encrypted, frequency-hopping 433 MHz link to the follower  ·  each joint's "
+                   "turn from the idle pose is the follower's angle from its arm zero", (c.x + 18, c.y + 40), 12, MUTED)
         body = pygame.Rect(c.x + 16, c.y + 64, c.w - 32, c.h - 80)
         rw = max(340, int(body.w * 0.3))
         self.draw_master_arm(surf, pygame.Rect(body.x, body.y, body.w - rw - 14, body.h))
@@ -1023,39 +1220,57 @@ class App:
         text(surf, "Master arm", (r.x + 18, r.y + 14), 15, BEIGE, True)
         text(surf, "live" if ms else "No data: connect to the master's COM port, or to the follower over WiFi with the "
              "radio up", (r.x + 18, r.y + 36), 12, GREEN if ms else MUTED)
-        dr = max(30, min(72, r.w // 6 - 30))
-        cy = r.y + 76 + dr
-        for j in range(3):
-            cx = r.x + r.w * (2 * j + 1) // 6
+        armed = time.monotonic() - self.idle_armed < 2
+        self.button(surf, pygame.Rect(r.right - 18 - 190, r.y + 14, 190, 32),
+                    "Click to confirm" if armed else "Set idle from master", self.capture_idle, "on" if armed else "plain", 13)
+        dr = max(26, min(58, r.w // 8 - 30))
+        cy = r.y + 80 + dr
+        for j, (name, ch) in enumerate(MASTER_JOINTS):
+            cx = r.x + r.w * (2 * j + 1) // 8
             ok = ms and ms["ok"][j]
             self.dial(surf, (cx, cy), dr, ms["deg"][j] if ok else None)
-            text(surf, "Joint %d" % (j + 1), (cx, cy + dr + 18), 14, BEIGE, True, "center")
+            text(surf, name, (cx, cy + dr + 18), 14, BEIGE, True, "center")
             text(surf, "%.2f°" % ms["deg"][j] if ok else "no reading" if ms else "–", (cx, cy + dr + 38), 14,
                  BEIGE if ok else RED_HI if ms else MUTED, anchor="center")
-            text(surf, "mux SD%d / SC%d" % (j, j), (cx, cy + dr + 58), 11, DIM, anchor="center")
-        y = cy + dr + 92
-        pots = (("Gripper pot", "GPIO1", "sign_pg", lambda: "%.0f %% open" % self.pot_grip()),
-                ("Turret pot", "GPIO2", "sign_pt", lambda: "turret %+.1f°" % self.pot_turret()))
-        for k, (name, pin, key, to) in enumerate(pots):
-            row = pygame.Rect(r.x + 18, y + k * 62, r.w - 36, 54)
-            text(surf, name, (row.x, row.y), 14, BEIGE, True)
-            text(surf, pin, (row.x + 104, row.y + 2), 12, DIM)
-            bar = pygame.Rect(row.x, row.y + 26, row.w - 136, 10)
-            pygame.draw.rect(surf, PANEL2, bar, border_radius=5)
-            if ms:
-                text(surf, "%.1f %%  →  %s" % (ms["pots"][k], to()), (bar.right, row.y), 13, BEIGE, anchor="topright")
-                pygame.draw.rect(surf, RED_HI, (bar.x, bar.y, bar.w * clamp(ms["pots"][k], 0, 100) / 100, bar.h),
-                                 border_radius=5)
-            inv = self.cfg[key] < 0
-            self.button(surf, pygame.Rect(row.right - 120, row.y + 12, 120, 30), "Inverted" if inv else "Normal",
-                        lambda key=key: self.flip(key), "on" if inv else "plain", 12)
-        y += 2 * 62 + 14
+            text(surf, "mux SD%d · idle %.2f°" % (ch, self.cfg["master_zero"][j]), (cx, cy + dr + 58), 11, DIM,
+                 anchor="center")
+            if ok:  # what the follower gets: the turn from idle, drawn direction
+                text(surf, "→ %+.1f° from idle" % self.master_offset(j), (cx, cy + dr + 76), 12, AMBER, anchor="center")
+            inv = self.cfg["mdir"][j] < 0
+            self.button(surf, pygame.Rect(cx - 50, cy + dr + 94, 100, 26), "Inverted" if inv else "Normal",
+                        lambda j=j: self.flip_mdir(j), "on" if inv else "plain", 12)
+        row = pygame.Rect(r.x + 18, cy + dr + 140, r.w - 36, 54)  # wrist-roll pot
+        text(surf, "Wrist roll pot", (row.x, row.y), 14, BEIGE, True)
+        text(surf, "GPIO1 · idle %.1f %%" % self.cfg["roll_zero"], (row.x + 118, row.y + 2), 12, DIM)
+        bar = pygame.Rect(row.x, row.y + 26, row.w - 136, 10)
+        pygame.draw.rect(surf, PANEL2, bar, border_radius=5)
+        if ms:
+            text(surf, "%.1f %%  →  roll %+.0f°" % (ms["roll"], self.pot_roll()), (bar.right, row.y), 13, BEIGE,
+                 anchor="topright")
+            pygame.draw.rect(surf, RED_HI, (bar.x, bar.y, bar.w * clamp(ms["roll"], 0, 100) / 100, bar.h), border_radius=5)
+        inv = self.cfg["sign_pr"] < 0
+        self.button(surf, pygame.Rect(row.right - 120, row.y + 12, 120, 30), "Inverted" if inv else "Normal",
+                    lambda: self.flip("sign_pr"), "on" if inv else "plain", 12)
+        row = row.move(0, 62)  # gripper button
+        text(surf, "Gripper button", (row.x, row.y), 14, BEIGE, True)
+        text(surf, "GPIO7 to GND, a press closes / opens", (row.x + 118, row.y + 2), 12, DIM)
+        if ms:
+            closed = ms["grip"]
+            pill = pygame.Rect(row.x, row.y + 22, 110, 26)
+            pygame.draw.rect(surf, RED if closed else PANEL2, pill, border_radius=13)
+            pygame.draw.rect(surf, RED_HI if closed else LINE, pill, 1, border_radius=13)
+            text(surf, "closed" if closed else "open", pill.center, 13, BEIGE, True, "center")
+        y = row.bottom + 22
         pygame.draw.line(surf, LINE, (r.x + 18, y), (r.right - 18, y))
         sw = pygame.Rect(r.x + 18, y + 18, 52, 28)
-        self.toggle(surf, sw, self.follow, self.toggle_follow)
+        self.toggle(surf, sw, self.follow or self.link.ser is not None, self.toggle_follow)  # always on over the radio
         text(surf, "Follow master", (sw.right + 12, sw.y - 2), 14, BEIGE, True)
-        text(surf, "With Control ON (Manual tab) the pots drive the gripper and turret, in place of Space / Ctrl and A / D",
-             (sw.right + 12, sw.y + 18), 12, MUTED)
+        note = ("With Control ON (Manual tab) the follower copies the master: encoders to the turret and joints, the roll "
+                "pot to the wrist roll, the button to the gripper, inside the joint limits and above the table. Always "
+                "on over the radio; over WiFi this switch turns it on. Check each direction on the Manual tab first: the "
+                "master's pose is drawn there in amber")
+        for k, ln in enumerate(wrap_text(note, 12, r.right - 18 - sw.right - 12)):
+            text(surf, ln, (sw.right + 12, sw.y + 18 + k * 17), 12, MUTED)
 
     def dial(self, surf, c, r, deg):
         """A sensor angle, 0° at the top; None: no reading."""
@@ -1369,13 +1584,12 @@ class App:
         text(surf, "A", (x - r - 14, y), 14, BEIGE if self.control and k[pygame.K_a] and not typing else DIM, True, "center")
         text(surf, "D", (x + r + 14, y), 14, BEIGE if self.control and k[pygame.K_d] and not typing else DIM, True, "center")
         text(surf, "Turret %+.1f°" % self.turret, (x, y + r + 12), 13, BEIGE, True, "center")
-        fol = self.following()
-        text(surf, "follows the master's pots" if fol else "top view · open loop", (x, y + r + 28), 11,
-             AMBER if fol else DIM, anchor="center")
+        text(surf, "top view · open loop", (x, y + r + 28), 11, DIM, anchor="center")
 
         gy = y + r + 52  # gripper gauge: Space closes, Ctrl opens
         held = lambda *keys: self.control and not typing and any(k[key] for key in keys)
-        text(surf, "Gripper %.0f %% open" % self.grip, (x, gy), 13, BEIGE, True, "center")
+        text(surf, "Gripper %.0f %% open" % self.grip, (x, gy), 13, AMBER if self.following() else BEIGE, True,
+             "center")  # amber: the master's button drives it
         bar = pygame.Rect(x - 60, gy + 12, 120, 8)
         pygame.draw.rect(surf, PANEL2, bar, border_radius=4)
         pygame.draw.rect(surf, RED_HI, (bar.x, bar.y, bar.w * self.grip / 100, bar.h), border_radius=4)
