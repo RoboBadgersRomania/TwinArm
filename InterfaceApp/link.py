@@ -12,6 +12,8 @@ Teensy -> PC   T,id,ok,deg,target,amps,tempC,volts,busAmps,mode,fault,jammed   o
                S,id,begin,start,target,sampleMs / S,id,i,deg,deg,... / S,id,end   step test curve, answer to "<id> s<deg>"
                R,idle|rec|move|play,take,secondsIn,takeSeconds,sdOk   the Teensy's recorder, with every telemetry sweep
                K,n,seconds ... K,end,count   the takes on the Teensy's SD card, answer to "takes"
+               Q,on|off,lead,slowestUs,id:wn:zeta,...   the replay MPC, answer to "mpc ..." (wn 0 = no model)
+               Q,test,ok,us   answer to "mpc test"
 gateway -> PC  M,turret,shoulder,elbow,wristPitch,rollPot%,gripClosed,okBits   the master arm 20 times a second:
                joints 0..360 deg (-1 no reading), the wrist-roll pot 0..100 %, the gripper button's state (1 closed)
                L,m|f,state,slots/s,ok%,rssi,snr,peerRssi,peerSnr,MHz   the radio once a second, seen from the master (m)
@@ -65,6 +67,7 @@ class Link:
         self.jam_cfg, self.jam_at = None, 0.0  # (tolerance deg, time ms) the Teensy uses
         self.captures = {}                   # CAN id -> last step test: start, target, dt, samples {i: deg}, done, at
         self.backup, self.backup_end = {}, None  # CAN id -> gains kept on the gateway; (motor count, time) of the last #load
+        self.mpc, self.mpc_test = None, None  # the Teensy's replay MPC (last Q line), its last self-test
 
     def connect(self, host, port=0):
         """A COM port (or /dev/tty...) is the master's gateway on USB; OSError if it cannot be opened."""
@@ -178,6 +181,15 @@ class Link:
                              "seen": t}
             elif f[0] == "K" and len(f) == 3 and f[1] != "end":
                 self.takes[int(f[1])] = float(f[2])
+            elif f[0] == "Q" and len(f) == 4 and f[1] == "test":
+                self.mpc_test = {"ok": f[2] == "1", "us": int(f[3]), "seen": t}
+            elif f[0] == "Q" and len(f) >= 4:
+                models = {}
+                for part in f[4:]:
+                    cid, wn, zeta = part.split(":")
+                    if float(wn) > 0:
+                        models[int(cid)] = (float(wn), float(zeta))
+                self.mpc = {"on": f[1] == "on", "lead": float(f[2]), "us": int(f[3]), "models": models, "seen": t}
             elif f[0] == "L" and len(f) == 10:
                 self.radio = {"role": f[1], "state": int(f[2]), "rate": int(f[3]), "ok": int(f[4]), "rssi": float(f[5]),
                               "snr": float(f[6]), "peer_rssi": float(f[7]), "peer_snr": float(f[8]), "mhz": float(f[9]),
@@ -248,4 +260,7 @@ if __name__ == "__main__":
     link.feed(b"R,play,3,4.20,12.30,1\nK,1,5.00\nK,3,12.30\nK,end,2\n", time.monotonic())
     assert link.recorder() == dict(link.take, state="play", no=3, at=4.2, len=12.3, sd=True)
     assert link.takes == {1: 5.0, 3: 12.3}
+    link.feed(b"Q,on,25.0,1480,1:0.00:0.00,2:6.20:0.77,3:5.10:0.90,4:0.00:0.00\r\nQ,test,1,365\n", time.monotonic())
+    assert link.mpc["on"] and link.mpc["lead"] == 25 and link.mpc["us"] == 1480
+    assert link.mpc["models"] == {2: (6.2, 0.77), 3: (5.1, 0.9)} and link.mpc_test["ok"] and link.mpc_test["us"] == 365
     print("link ok")

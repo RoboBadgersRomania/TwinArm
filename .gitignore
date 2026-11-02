@@ -55,3 +55,6 @@ desktop.ini
 
 # Step-test exports from the app
 InterfaceApp/step_tests/
+
+# Tuning sessions from bench.py
+InterfaceApp/sessions/

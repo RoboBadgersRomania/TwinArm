@@ -35,6 +35,7 @@ JOINTS = [  # name, CAN driver id, graph colour; the first three are the side-vi
     ("Wrist roll", 4, (120, 150, 245)),
 ]
 TOP, SIDE, BAR = 60, 92, 64  # top bar height, sidebar width, control bar height
+ALIGN_H = 112  # the master / follower alignment strip on the Manual tab
 GRIP_IDLE = 23  # "p" value where the Teensy parks the gripper: GRIPPER_MID_US 1500 on its 1350..2000 us scale
 
 DEFAULTS = {
@@ -55,6 +56,8 @@ DEFAULTS = {
     "roll_dps": 60,                             # deg/s the wrist roll motor spins at (its driver's limit, Q/E drive it)
     "roll_units": 8,                            # roll driver rpm per output rpm: it counts motor rpm, before the 8:1 gear
     "speed": 30,                                # %, the Speed field: scales the joints and the turret
+    "pickup": 5,                                # deg: following, a joint only starts copying the master this close
+    "roll_offset": 90,                          # deg: the master's roll (from roll_zero) at the follower's neutral 0
     "jam_err": 4, "jam_ms": 400, "jam_on": 1,   # jam detection on the Teensy: tolerance deg, time ms, switch
     "tuning": {},                               # "<CAN id>": [pos kp, pos ki, vel kp, vel ki, max amps] as typed
     "window": 20,                               # graph history, s
@@ -75,6 +78,8 @@ ROWS = [  # label, key[, step, min, max]; no step = toggle, key None = section t
     ("Gripper speed, Space / Ctrl (%/s)", "grip_rate", 5, 5, 200),
     ("Joint speed at 100 % (rpm)", "rpm_max", 1, 1, 60),
     ("Wrist roll motor speed (°/s)", "roll_dps", 5, 5, 360),
+    ("Follow pick-up window (± °)", "pickup", 1, 1, 30),
+    ("Master roll at follower's 0 (°)", "roll_offset", 5, -180, 180),
     ("Roll driver rpm per output rpm", "roll_units", 1, 1, 50),
     ("Display", None),
     ("Graph window (s)", "window", 5, 5, 120), ("Mirror view (arm faces left)", "mirror"),
@@ -83,6 +88,7 @@ GAIN_NAMES = ("Position Kp", "Position Ki", "Velocity Kp", "Velocity Ki")  # tun
 CALIBRATION = {"zero1", "zero2", "zero3", "sign1", "sign2", "sign3", "sign4", "sign_t", "sign_g", "sign_pr"}
 MASTER_JOINTS = (("Turret", 0), ("Shoulder", 1), ("Elbow", 2), ("Wrist pitch", 4))  # the master's MT6701s, mux channel
 ROLL_POT_TRAVEL = 270  # degrees the master's roll pot turns end to end (its reading at idle is the roll zero)
+POT_ALPHA, POT_BAND = 0.25, 0.6  # roll pot low-pass per 20 Hz reading, and hysteresis in % (0.6 % = 1.6° of roll)
 
 
 def load():
@@ -194,6 +200,7 @@ class App:
             for k, v in enumerate(self.cfg["tuning"].get(str(cid), [""] * 5)):
                 self.fields["t%d_%d" % (cid, k)] = v
         self.sel = JOINTS[0][1]         # motor on the step-test graph
+        self.scope = None               # Manual tab graphs: None = every joint, else one CAN id in detail
         self.gains_seen, self.jam_seen = {j[1]: 0.0 for j in JOINTS}, 0.0
         self.step_at, self.step_cid = 0.0, None  # when the last step test was asked for, and for which motor
         self.analysis = {}              # CAN id -> (capture time, metrics, hints) of its last step test
@@ -215,6 +222,11 @@ class App:
         self.tick_at = self.hello_at = time.monotonic()
         self.toast_msg, self.toast_at, self.release_armed = "", 0.0, 0.0
         self.idle_armed = 0.0           # first click of Set idle from master
+        self.engaged = set()            # following: joints picked up ("t" turret, 0-2 side chain, "r" roll)
+        self.waiting = {}               # following: joints not picked up yet -> how far the master is, deg
+        self.pick_last = {}             # the same at the previous tick, to catch the master going past
+        self.fit_cache, self.mpc_at = (None, {}), 0.0  # model_fit.json (mtime, models); last MPC sync
+        self.pot_seen, self.pot_f, self.pot_held = None, None, None  # the roll pot, low-passed and with hysteresis
         self.hits, self.view, self.tip_px, self.cursor, self.layer = [], (0, 0, 1, 1), None, None, None
         self.card_pick = {}             # chosen spot per info card, kept while it stays clear
         self.ports, self.ports_at = [], 0.0  # USB serial ports seen, for the Connection panel
@@ -248,11 +260,44 @@ class App:
         """% open the master's gripper button asks for: each press closes or opens it fully."""
         return 0.0 if self.link.master["grip"] else 100.0
 
+    def master_roll(self):
+        """The master's wrist roll, degrees from its pot's zero reading (roll_zero), filtered."""
+        pot = self.link.master["roll"] if self.pot_held is None else self.pot_held
+        return self.cfg["sign_pr"] * (pot - self.cfg["roll_zero"]) / 100 * ROLL_POT_TRAVEL
+
     def pot_roll(self):
-        """Wrist roll the master's roll pot asks for, degree for degree from its idle reading, inside the joint limit."""
+        """Wrist roll the master asks of the follower, degree for degree, inside the joint limit: the master at
+        roll_offset (+90°) is the follower's neutral 0, which leaves the pot's travel about even on both sides."""
         lim = self.cfg["limit"]
-        turn = (self.link.master["roll"] - self.cfg["roll_zero"]) / 100 * ROLL_POT_TRAVEL
-        return clamp(self.cfg["sign_pr"] * turn, -lim, lim)
+        return clamp(self.master_roll() - self.cfg["roll_offset"], -lim, lim)
+
+    def pick_up(self, key, want, now):
+        """Following, a joint copies the master only once the master has come within the pick-up window of where
+        the follower is: Control ON with the master elsewhere makes nothing jump, and a wrong idle or direction
+        shows as a joint that never picks up instead of one that swings away."""
+        if key in self.engaged:
+            return True
+        d, last = want - now, self.pick_last.get(key)
+        crossed = last is not None and (d > 0) != (last > 0) and abs(d - last) < 90  # went past between two readings
+        if abs(d) <= self.cfg["pickup"] or crossed:
+            self.engaged.add(key)
+            return True
+        self.waiting[key] = self.pick_last[key] = d
+        return False
+
+    def filter_pot(self):
+        """The roll pot: a low-pass on each new reading, then hysteresis, so its ADC jitter does not shake the wrist."""
+        ms = self.link.master
+        if not ms or ms["seen"] == self.pot_seen:
+            return
+        self.pot_seen, p = ms["seen"], ms["roll"]
+        self.pot_f = p if self.pot_f is None else self.pot_f + POT_ALPHA * (p - self.pot_f)
+        if self.pot_held is None:
+            self.pot_held = self.pot_f
+        elif self.pot_f > self.pot_held + POT_BAND:
+            self.pot_held = self.pot_f - POT_BAND
+        elif self.pot_f < self.pot_held - POT_BAND:
+            self.pot_held = self.pot_f + POT_BAND
 
     def master_offset(self, j):
         """Master joint j (turret, shoulder, elbow, wrist pitch) from its idle reading, in the drawing's direction:
@@ -307,9 +352,14 @@ class App:
             self.tool = sum(self.g)
             self.roll = self.cfg["sign4"] * self.link.motors[JOINTS[3][1]].deg
             self.sent.clear()
+            self.engaged, self.waiting, self.pick_last = set(), {}, {}  # following: every joint is picked up again
             self.full_at = 0.0
             self.link.send(*self.speed_lines())
-        self.toast(why or ("Control ON: drag the red tip" if on else "Control OFF: the arm holds its pose"))
+        if on and self.following():
+            on_msg = "Control ON: each joint copies the master once the master comes to it (pick-up)"
+        else:
+            on_msg = "Control ON: drag the red tip"
+        self.toast(why or (on_msg if on else "Control OFF: the arm holds its pose"))
 
     def solve(self, tip):
         """Commanded joints for a tip target: inside the joint limits, the whole arm above the table."""
@@ -349,13 +399,19 @@ class App:
             if not fol:
                 self.grip = clamp(self.grip + (ctrl - k[pygame.K_SPACE]) * self.cfg["grip_rate"] * dt, 0, 100)
         if fol:  # a copy of the master: encoders -> joints and turret, roll pot -> wrist roll, button -> gripper
-            g = self.master_pose()
-            if g and min(p[1] for p in fk(g, self.lengths())[1:]) >= 15 - self.cfg["table"]:  # not into the table
-                self.g, self.tool = g, sum(g)
+            self.waiting = {}
+            want = self.master_pose()
+            if want:  # each joint holds until the master comes to it, then copies it
+                g = [w if self.pick_up(i, w, now) else now for i, (w, now) in enumerate(zip(want, self.g))]
+                if min(p[1] for p in fk(g, self.lengths())[1:]) >= 15 - self.cfg["table"]:  # not into the table
+                    self.g, self.tool = g, sum(g)
             t, tl = self.master_offset(0), self.cfg["turret_limit"]
-            if t is not None:
+            if t is not None and self.pick_up("t", clamp(t, -tl, tl), self.turret):
                 self.turret = clamp(t, -tl, tl)
-            self.grip, self.roll = self.master_grip(), self.pot_roll()
+            roll = self.pot_roll()
+            if self.pick_up("r", roll, self.roll):
+                self.roll = roll
+            self.grip = self.master_grip()
         targets = {JOINTS[i][1]: self.motor(i, self.g[i]) for i in range(3)}
         targets[JOINTS[3][1]] = self.cfg["sign4"] * self.roll
         targets["t"] = self.cfg["sign_t"] * self.turret
@@ -619,7 +675,8 @@ class App:
         for name in ("steptest_%s_model.json" % stamp, "model_fit.json"):  # model_fit.json = the latest, for sim.py
             compare.save_model(fits, None, os.path.join(folder, name))
         self.suite_file = path
-        self.toast("Whole-arm test saved: step_tests/%s" % os.path.basename(path))
+        self.mpc_sync(force=True)  # the new models go to the Teensy's replay MPC
+        self.toast("Whole-arm test saved: step_tests/%s, new models sent to the MPC" % os.path.basename(path))
 
     def open_tests(self):
         folder = os.path.join(HERE, "step_tests")
@@ -705,7 +762,46 @@ class App:
 
     def refresh_takes(self):
         self.link.takes.clear()  # the answer lists them all again; a take deleted from the card disappears
-        self.link.send("takes")
+        self.link.send("takes", "mpc")  # and the replay MPC's state
+
+    def mpc_models(self):
+        """{CAN id: (wn, zeta)} the latest whole-arm test fitted (step_tests/model_fit.json), inside what the
+        Teensy's MPC takes (wn 0.5-150, zeta 0.1-4); read again when the file changes."""
+        path = os.path.join(HERE, "step_tests", "model_fit.json")
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return {}
+        if self.fit_cache[0] != mtime:
+            try:
+                with open(path) as f:
+                    fits = json.load(f)
+            except (OSError, ValueError):
+                fits = {}
+            models = {}
+            for cid, fit in fits.items():
+                wn, z = fit.get("wn"), fit.get("zeta")
+                if int(cid) in self.link.motors and wn and z and 0.5 <= wn <= 150 and 0.1 <= z <= 4:
+                    models[int(cid)] = (round(wn, 3), round(z, 3))
+            self.fit_cache = (mtime, models)
+        return self.fit_cache[1]
+
+    def mpc_sync(self, force=False):
+        """The Teensy replays through its MPC on every joint it has a model for (kept in its EEPROM): keep those the
+        models of the latest whole-arm test. Asks what it holds, then sends only what differs."""
+        now = time.monotonic()
+        if not self.connected or not self.link.robot_online() or (not force and now - self.mpc_at < 5):
+            return
+        self.mpc_at = now
+        mp, want = self.link.mpc, self.mpc_models()
+        if not mp or now - mp["seen"] > 30:
+            self.link.send("mpc")
+            return
+        have = mp["models"]  # the Q line rounds to 0.01
+        stale = [c for c, (wn, z) in sorted(want.items())
+                 if c not in have or abs(have[c][0] - wn) > 0.01 or abs(have[c][1] - z) > 0.01]
+        if stale:
+            self.link.send(*["mpc %d %.3f %.3f" % (c, *want[c]) for c in stale] + ["mpc"])
 
     def clear_faults(self):
         self.link.send(*("%d c" % j[1] for j in JOINTS))  # clears driver faults and jams
@@ -761,8 +857,9 @@ class App:
         if self.control:
             self.set_control(False, "Control OFF: idle set from the master")
         self.cfg["master_zero"] = [round(d, 2) for d in ms["deg"]]
-        self.cfg["roll_zero"] = round(ms["roll"], 1)
-        save(self.cfg)
+        pot = ms["roll"] if self.pot_held is None else self.pot_held  # the master's roll now is the follower's 0:
+        self.cfg["roll_zero"] = round(pot - self.cfg["sign_pr"] * self.cfg["roll_offset"] / ROLL_POT_TRAVEL * 100, 1)
+        save(self.cfg)                                                # so it reads roll_offset (+90°) there
         self.toast("Idle set: turret %.2f°, shoulder %.2f°, elbow %.2f°, wrist %.2f°, roll pot %.1f %%"
                    % tuple(self.cfg["master_zero"] + [self.cfg["roll_zero"]]))
 
@@ -844,6 +941,8 @@ class App:
 
     def update(self):
         self.link.poll()
+        self.filter_pot()
+        self.mpc_sync()
         for _, cid, _ in JOINTS:  # gains just read from a driver go into its fields, except the one being typed in
             m = self.link.motors[cid]
             if m.gains_at > self.gains_seen[cid]:
@@ -1014,7 +1113,10 @@ class App:
 
     def draw_arm(self, surf, c):
         pygame.draw.rect(surf, PANEL, c, border_radius=14)
-        area = pygame.Rect(c.x, c.y, c.w, c.h - BAR)
+        strip = self.link.master_online()  # master vs follower, joint by joint, under the drawing
+        area = pygame.Rect(c.x, c.y, c.w, c.h - BAR - (ALIGN_H if strip else 0))
+        if strip:
+            self.draw_align(surf, pygame.Rect(c.x + 14, area.bottom, c.w - 28, ALIGN_H - 8))
         L = self.lengths()
         R = sum(L)
         s = max(0.05, min((area.w - 60) / (1.4 * R), (area.h - 50) / (1.15 * R + self.cfg["table"])))
@@ -1178,7 +1280,22 @@ class App:
         text(surf, "at", (sf.x - 10, sf.centery), 13, BEIGE, True, "midright")
         self.field(surf, sf, "rspeed")
         text(surf, "%", (sf.right - 12, sf.centery), 15, MUTED, anchor="midright")
-        y += h + 28
+        y += h + 22
+        mp = self.link.mpc if self.link.mpc and time.monotonic() - self.link.mpc["seen"] < 30 else None
+        plain = [j[0] for j in JOINTS if not mp or j[1] not in mp["models"]]
+        text(surf, "MPC replay, always on", (x, y), 14, GREEN if mp and not plain else AMBER if mp else MUTED, True)
+        if mp:
+            models = "  ·  ".join("%s ωn %.1f ζ %.2f" % (next(j[0] for j in JOINTS if j[1] == cid), wn, z)
+                                  for cid, (wn, z) in sorted(mp["models"].items())) or "no joint has a model yet"
+            info = "%s  ·  lead ≤ %g°%s" % (models, mp["lead"], "  ·  slowest tick %.1f ms" % (mp["us"] / 1000)
+                                             if mp["us"] else "")
+            if plain:
+                info += "  ·  plain replay on %s: run the whole-arm test (Configuration)" % ", ".join(plain).lower()
+        else:
+            info = "Teensy has not answered: flash the latest motorcontroller.ino" if tk else "–"
+        for k, ln in enumerate(wrap_text(info, 12, r.w - 36)[:2]):
+            text(surf, ln, (x, y + 20 + 16 * k), 12, MUTED)
+        y += 58
         for note in ("1  Control ON and drive the follower: with the master over the radio, or by dragging over WiFi.",
                      "2  Record, move, then Stop (Control OFF stops it too). The take is saved on the card as TAKEnnn, "
                      "100 samples a second, up to 5 minutes.",
@@ -1241,12 +1358,13 @@ class App:
                         lambda j=j: self.flip_mdir(j), "on" if inv else "plain", 12)
         row = pygame.Rect(r.x + 18, cy + dr + 140, r.w - 36, 54)  # wrist-roll pot
         text(surf, "Wrist roll pot", (row.x, row.y), 14, BEIGE, True)
-        text(surf, "GPIO1 · idle %.1f %%" % self.cfg["roll_zero"], (row.x + 118, row.y + 2), 12, DIM)
+        text(surf, "GPIO1 · zero %.1f %% · follower's 0 at master %+g°" % (self.cfg["roll_zero"], self.cfg["roll_offset"]),
+             (row.x + 118, row.y + 2), 12, DIM)
         bar = pygame.Rect(row.x, row.y + 26, row.w - 136, 10)
         pygame.draw.rect(surf, PANEL2, bar, border_radius=5)
         if ms:
-            text(surf, "%.1f %%  →  roll %+.0f°" % (ms["roll"], self.pot_roll()), (bar.right, row.y), 13, BEIGE,
-                 anchor="topright")
+            text(surf, "%.1f %%  ·  master %+.0f°  →  follower %+.0f°" % (ms["roll"], self.master_roll(), self.pot_roll()),
+                 (bar.right, row.y), 13, BEIGE, anchor="topright")
             pygame.draw.rect(surf, RED_HI, (bar.x, bar.y, bar.w * clamp(ms["roll"], 0, 100) / 100, bar.h), border_radius=5)
         inv = self.cfg["sign_pr"] < 0
         self.button(surf, pygame.Rect(row.right - 120, row.y + 12, 120, 30), "Inverted" if inv else "Normal",
@@ -1569,6 +1687,80 @@ class App:
         if m.fault:
             text(surf, "fault: " + m.faults, (r.right - 10, r.y + 61), 11, RED_HI, True, "topright")
 
+    def alignment(self):
+        """Per joint, the follower and what the master asks of it, both in degrees from the arm zero in the
+        drawing's direction (the same values the pick-up compares): [(key, name, colour, follower, master or None)]."""
+        lim, tl = self.cfg["limit"], self.cfg["turret_limit"]
+        meas = self.measured()
+        out = []
+        t = self.master_offset(0)
+        out.append(("t", "Turret", BEIGE, self.turret, clamp(t, -tl, tl) if t is not None else None))
+        for i in range(3):  # where the follower really is (telemetry); the command when there is none
+            fol = (meas[i] if meas else self.g[i] if self.control else self.zero()[i]) - self.zero()[i]
+            o = self.master_offset(i + 1)
+            out.append((i, JOINTS[i][0], JOINTS[i][2], fol, clamp(o, -lim, lim) if o is not None else None))
+        roll = self.cfg["sign4"] * self.link.motors[JOINTS[3][1]].deg if meas else self.roll
+        out.append(("r", JOINTS[3][0], JOINTS[3][2], roll, self.pot_roll()))
+        return out
+
+    def draw_align(self, surf, r):
+        """Master (amber) over follower, one dial per joint, with what is left to line up: before Control ON this
+        shows whether starting is safe, after it which joints are still waiting for the pick-up."""
+        pygame.draw.rect(surf, PANEL2, r, border_radius=12)
+        rows = self.alignment()
+        win = self.cfg["pickup"]
+        live = self.control and self.following()
+        far = [n for k, n, _, f, m in rows if m is not None and abs(m - f) > win and not (live and k in self.engaged)]
+        missing = [n for _, n, _, _, m in rows if m is None]
+        if live:
+            head, hc = ("Following the master on every joint", GREEN) if not far else (
+                "Waiting for the pick-up: bring the master to the follower on %s" % ", ".join(far).lower(), AMBER)
+        elif missing:
+            head, hc = "No reading from the master's %s" % ", ".join(missing).lower(), RED_HI
+        else:
+            head, hc = ("Master and follower line up (±%g°): Control ON is smooth" % win, GREEN) if not far else (
+                "Line up before Control ON: %s" % ", ".join(far).lower(), AMBER)
+        text(surf, "Master ↔ follower", (r.x + 14, r.y + 8), 13, BEIGE, True)
+        text(surf, head, (r.x + 150, r.y + 9), 12, hc, True)
+        text(surf, "amber = master  ·  colour = follower", (r.right - 14, r.y + 9), 11, MUTED, anchor="topright")
+        cw = r.w / len(rows)
+        for k, (key, name, col, fol, mas) in enumerate(rows):
+            x0 = r.x + k * cw
+            rad = min(30, (r.h - 40) // 2)
+            c = (round(x0 + 14 + rad), r.y + 32 + rad)
+            d = None if mas is None else mas - fol
+            picked = live and key in self.engaged
+            ok = picked or (d is not None and abs(d) <= win)
+            ring = LINE if d is None else GREEN if ok else AMBER
+            pygame.draw.circle(surf, PANEL, c, rad)
+            pygame.draw.circle(surf, ring, c, rad, 2)
+            point = lambda a, rr: (c[0] - math.sin(math.radians(a)) * rr, c[1] - math.cos(math.radians(a)) * rr)
+            pygame.draw.line(surf, DIM, point(0, rad - 6), point(0, rad), 2)  # the arm zero
+            if d is not None and abs(d) > 0.5:  # the gap still to close
+                a0, a1 = sorted((90 + fol, 90 + mas))
+                pygame.draw.arc(surf, AMBER, (c[0] - rad + 5, c[1] - rad + 5, 2 * rad - 10, 2 * rad - 10),
+                                math.radians(a0), math.radians(a1), 3)
+            for a, colour, w in ((fol, col, 4), (mas, AMBER, 2)):
+                if a is None:
+                    continue
+                pygame.draw.line(surf, colour, c, point(a, rad - 6), w)
+                if key == "r":  # wrist roll, seen along the gripper: the jaws as a bar, so upside down shows
+                    tip, side = point(a, rad - 9), (math.cos(math.radians(a)) * 7, -math.sin(math.radians(a)) * 7)
+                    pygame.draw.line(surf, colour, (tip[0] - side[0], tip[1] - side[1]),
+                                     (tip[0] + side[0], tip[1] + side[1]), w)
+            pygame.draw.circle(surf, BEIGE, c, 3)
+            tx = c[0] + rad + 10
+            text(surf, name, (tx, r.y + 32), 12, col, True)
+            text(surf, "S %+.1f°" % fol, (tx, r.y + 49), 12, BEIGE)
+            text(surf, "M %+.1f°" % mas if mas is not None else "M –", (tx, r.y + 65), 12, AMBER if mas is not None else DIM)
+            state, sc = ("no reading", RED_HI) if d is None else ("following", GREEN) if picked else (
+                ("lined up", GREEN) if ok else ("%.0f° to go" % abs(d), AMBER))
+            sx = tx
+            if sc == GREEN:  # a drawn check: the UI font has no ✓
+                pygame.draw.lines(surf, GREEN, False, [(sx, r.y + 89), (sx + 4, r.y + 93), (sx + 11, r.y + 84)], 2)
+                sx += 16
+            text(surf, state, (sx, r.y + 81), 12, sc, True)
+
     def draw_turret(self, surf, c):
         x, y = c
         r = 34
@@ -1578,6 +1770,10 @@ class App:
         pygame.draw.arc(surf, DIM, (x - r + 4, y - r + 4, 2 * r - 8, 2 * r - 8), math.pi / 2 - lim, math.pi / 2 + lim, 2)
         a = math.radians(self.turret)
         pygame.draw.line(surf, RED_HI, c, (x - math.sin(a) * (r - 7), y - math.cos(a) * (r - 7)), 4)
+        mt = self.master_offset(0) if self.link.master_online() else None
+        if mt is not None:  # where the master's turret is, in amber like its pose in the drawing
+            m = math.radians(clamp(mt, -self.cfg["turret_limit"], self.cfg["turret_limit"]))
+            pygame.draw.line(surf, AMBER, c, (x - math.sin(m) * (r - 3), y - math.cos(m) * (r - 3)), 2)
         pygame.draw.circle(surf, BEIGE, c, 5)
         k = pygame.key.get_pressed()
         typing = self.focus is not None
@@ -1598,12 +1794,119 @@ class App:
              True, "topright")
 
     def draw_graphs(self, surf, r):
+        """The Manual tab's right column: a joint picker, then every joint at a glance or one joint in detail."""
+        bar = pygame.Rect(r.x, r.y, r.w, 30)
+        opts = [("All", None, BEIGE)] + [(n.replace("Wrist ", "").capitalize(), cid, col) for n, cid, col in JOINTS]
+        w = (bar.w - 6 * (len(opts) - 1)) / len(opts)
+        for k, (label, cid, col) in enumerate(opts):
+            chip = pygame.Rect(round(bar.x + k * (w + 6)), bar.y, round(w), bar.h)
+            on = self.scope == cid
+            hover = chip.collidepoint(pygame.mouse.get_pos())
+            pygame.draw.rect(surf, PANEL2 if on or hover else PANEL, chip, border_radius=8)
+            pygame.draw.rect(surf, col if on else LINE, chip, 1 + on, border_radius=8)
+            text(surf, label, chip.center, 12, col if on else MUTED, on, "center")
+            self.hits.append((chip, lambda cid=cid: setattr(self, "scope", cid)))
+        body = pygame.Rect(r.x, bar.bottom + 10, r.w, r.bottom - bar.bottom - 10)
+        if self.scope is None:
+            self.draw_overview(surf, body)
+        else:
+            self.draw_joint_scope(surf, body, self.scope)
+
+    def recent(self, cid):
+        """The joint's telemetry inside the graph window: (t, error or None, amps, temp, deg, target)."""
+        start = time.monotonic() - self.cfg["window"]
+        return [h for h in self.link.motors[cid].hist if h[0] >= start]
+
+    @staticmethod
+    def speeds(hist):
+        """Joint speed (deg/s) from successive angles, as segments; a gap in the telemetry breaks the line."""
+        segs, seg = [], []
+        for a, b in zip(hist, hist[1:]):
+            dt = b[0] - a[0]
+            if not 0.02 < dt < 0.5:
+                if seg:
+                    segs.append(seg)
+                seg = []
+                continue
+            seg.append((b[0], (b[4] - a[4]) / dt))
+        return segs + [seg] if seg else segs
+
+    @staticmethod
+    def lag(hist):
+        """How far the joint trails its target (s): the shift that best lines the angle up with the target.
+        None while the target barely moved, since there is nothing to line up."""
+        h = [x for x in hist if x[1] is not None]
+        if len(h) < 30 or max(x[5] for x in h) - min(x[5] for x in h) < 1.0:
+            return None
+        T, D = [x[5] for x in h], [x[4] for x in h]
+        costs = [sum((D[i + k] - T[i]) ** 2 for i in range(len(h) - k)) / (len(h) - k) for k in range(16)]
+        k = min(range(len(costs)), key=costs.__getitem__)
+        if 0 < k < len(costs) - 1:  # between samples: the bottom of a parabola through the three costs
+            a, b, c = costs[k - 1:k + 2]
+            if a - 2 * b + c > 0:
+                k += 0.5 * (a - c) / (a - 2 * b + c)
+        return k * (h[-1][0] - h[0][0]) / (len(h) - 1)
+
+    def speed_limit(self, cid):
+        """deg/s of output the driver was told it may move at."""
+        return self.cfg["roll_dps"] if cid == JOINTS[3][1] else self.rpm(cid) * 6
+
+    def draw_joint_scope(self, surf, r, cid):
+        """One joint as a control loop: setpoint and response, error, speed against its limit, current."""
+        name, _, col = next(j for j in JOINTS if j[1] == cid)
+        m = self.link.motors[cid]
+        hist = self.recent(cid)
+        errs = [h[1] for h in hist if h[1] is not None]
+        amps = [abs(h[2]) for h in hist]
+        segs = self.speeds(hist)
+        peak = max((abs(v) for s in segs for _, v in s), default=None)
+        lag, limit = self.lag(hist), self.speed_limit(cid)
+        online = m.ok and time.monotonic() - m.seen < 1.0
+        card = pygame.Rect(r.x, r.y, r.w, 98)
+        pygame.draw.rect(surf, PANEL, card, border_radius=12)
+        pygame.draw.rect(surf, col, (card.x + 14, card.y + 15, 18, 4), border_radius=2)
+        text(surf, "%s  #%d" % (name, cid), (card.x + 40, card.y + 8), 14, BEIGE, True)
+        state = "JAMMED" if m.jam else (MODES[m.mode] if m.mode < len(MODES) else "?") if online else "offline"
+        text(surf, "%s · last %d s" % (state, self.cfg["window"]), (card.right - 14, card.y + 10), 11,
+             RED_HI if m.jam else MUTED, m.jam, "topright")
+        rms = math.sqrt(sum(e * e for e in errs) / len(errs)) if errs else None
+        tol = self.link.jam_cfg[0] if self.link.jam_cfg else self.cfg["jam_err"]
+        tiles = [("RMS error", "%.2f°" % rms if rms is not None else "–", BEIGE),
+                 ("Max error", "%.2f°" % max(abs(e) for e in errs) if errs else "–",
+                  RED_HI if errs and max(abs(e) for e in errs) > tol else BEIGE),  # past the jam tolerance
+                 ("Trails target by", "%.0f ms" % (1000 * lag) if lag is not None else "– (no move)", BEIGE),
+                 ("Peak / limit speed", "%.0f / %.0f°/s" % (peak, limit) if peak is not None else "–",
+                  AMBER if peak and peak > 0.9 * limit else BEIGE),  # at the limit: the gains are not what limits it
+                 ("Current avg · peak", "%.2f · %.2f A" % (sum(amps) / len(amps), max(amps)) if amps else "–", BEIGE),
+                 ("Temp · power", "%d °C · %.1f W" % (m.temp, m.watts) if online else "–",
+                  RED_HI if m.temp >= 75 else AMBER if m.temp >= 60 else BEIGE)]
+        tw = (card.w - 28) / 3
+        for k, (label, value, vc) in enumerate(tiles):
+            x, y = card.x + 14 + (k % 3) * tw, card.y + 32 + (k // 3) * 32
+            text(surf, label, (x, y), 11, MUTED)
+            text(surf, value, (x, y + 13), 13, vc, True)
+        top = card.bottom + 10
+        gh = (r.bottom - top - 30) // 4
+        g = lambda k: pygame.Rect(r.x, top + k * (gh + 10), r.w, gh)
+        self.graph(surf, g(0), "Angle (colour) and target (grey)", "°", [(cid, 5, MUTED), (cid, 4, col)], False, 2.0)
+        self.graph(surf, g(1), "Tracking error  (target − actual)", "°", [(cid, 1, col)], True, 1.0)
+        now, win = time.monotonic(), self.cfg["window"]
+        series = [(col, segs)]
+        if peak and peak > 0.4 * limit:  # the limit lines only once the joint gets near them, or they squash the curve
+            series = [(MUTED, [[(now - win, s * limit), (now, s * limit)]]) for s in (1, -1)] + series
+        self.plot(surf, g(2), "Speed, from the telemetry" + ("  ·  grey: limit" if len(series) > 1 else ""), "°/s",
+                  series, (now - win, now), ("-%d s" % win, "now"), True, 2.0)
+        self.graph(surf, g(3), "Phase current", "A", [(cid, 2, col)], False, 0.5)
+
+    def draw_overview(self, surf, r):
         legend = pygame.Rect(r.x, r.y, r.w, 38 + 22 * len(JOINTS))
         pygame.draw.rect(surf, PANEL, legend, border_radius=12)
         text(surf, "Motors", (legend.x + 14, legend.y + 10), 14, BEIGE, True)
-        text(surf, "tracking error  ·  current", (legend.right - 14, legend.y + 12), 11, MUTED, anchor="topright")
+        text(surf, "tracking error  ·  current  ·  click for detail", (legend.right - 14, legend.y + 12), 11, MUTED,
+             anchor="topright")
         for i, (name, cid, col) in enumerate(JOINTS):
             y = legend.y + 36 + i * 22
+            self.hits.append((pygame.Rect(legend.x + 6, y - 2, legend.w - 12, 22), lambda cid=cid: setattr(self, "scope", cid)))
             m = self.link.motors[cid]
             pygame.draw.rect(surf, col, (legend.x + 14, y + 7, 20, 4), border_radius=2)
             text(surf, "%s  #%d" % (name, cid), (legend.x + 44, y), 13, BEIGE)
@@ -1765,7 +2068,8 @@ class App:
         if not self.toast_msg or time.monotonic() - self.toast_at > 3.5:
             return
         img = font(14).render(self.toast_msg, True, BEIGE)
-        r = img.get_rect(center=(content.centerx, content.bottom - BAR - 40)).inflate(28, 14)
+        lift = ALIGN_H if self.tab == 0 and self.link.master_online() else 0  # above the alignment strip
+        r = img.get_rect(center=(content.centerx, content.bottom - BAR - 40 - lift)).inflate(28, 14)
         pygame.draw.rect(surf, PANEL2, r, border_radius=10)
         pygame.draw.rect(surf, RED_HI, r, 1, border_radius=10)
         surf.blit(img, img.get_rect(center=r.center))
