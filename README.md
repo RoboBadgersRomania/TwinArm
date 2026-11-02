@@ -307,7 +307,7 @@ TwinArm/
 │   │   ├── lightgateway/
 │   │   │   └── lightgateway.ino          follower's LightGateway 1.0 (ESP32-S3): WiFi ↔ UART bridge + radio
 │   │   ├── master_arm/
-│   │   │   └── master_arm.ino            master's LightGateway: 3 MT6701 joints, 2 pots, radio, app link on USB
+│   │   │   └── master_arm.ino            master's LightGateway: 4 MT6701 joints, roll pot, gripper button, radio, USB
 │   │   └── slave_arm/
 │   │       ├── motorcontroller/          follower firmware (Teensy 4.1)
 │   │       │   ├── motorcontroller.ino     discovery, homing, serial jog console, gateway link
@@ -358,6 +358,10 @@ On boot it runs the CAN decoder self-test, pings drivers **1–4** and prints fi
 | `<id> m<amps>` | max current of the driver | `1 m8` |
 | `<id> s<deg>` | step test: move by `deg` from where it is, sample every 10 ms for 2 s, send the curve (blocks 2 s) | `1 s5` |
 | `j [deg ms]` | read jam detection, or set its tolerance and time (`ms` 0 = off) | `j 4 400` |
+| `rec` | record a take: the commanded joints, turret and gripper, 100 times a second, up to 5 min | `rec` |
+| `stop` | end the recording (saved on the SD card as `TAKEnnn.BIN`) or the replay (the arm holds) | `stop` |
+| `play <%>` | replay the loaded take at 10–200 % speed: a minimum-jerk move to its first pose, then the take, smoothed; a manual move or a jam stops it | `play 100` |
+| `load <n>` / `takes` | load take *n* from the card / list the takes on it | `load 3` |
 
 **Calibration knobs** at the top of the sketch
 
@@ -413,7 +417,9 @@ Type a pulse width in microseconds (for example `1500`) in the Serial Monitor an
 
 ### Wireless interface: `InterfaceApp`
 
-A pygame app that drives and watches the follower over **WiFi**, through a LightGateway 1.0 mounted on the robot, or over the **LoRa radio**, through the master arm's LightGateway on USB (type its COM port in the Connection panel). The *LoRa Master* tab shows the master arm (three MT6701 joints, the gripper and turret pots) and the radio link; *Follow master* lets the pots drive the gripper and turret while Control is ON.
+A pygame app that drives and watches the follower over **WiFi**, through a LightGateway 1.0 mounted on the robot, or over the **LoRa radio**, through the master arm's LightGateway on USB (type its COM port in the Connection panel). The *LoRa Master* tab shows the master arm (four MT6701s: turret, shoulder, elbow, wrist pitch; the wrist-roll pot; the gripper button) and the radio link; Over the radio the master is the controller: no tip dragging or keys, the follower copies the master whenever Control is ON. Over WiFi the same happens with *Follow master* switched on. Either way the follower copies the master: each encoder's turn from the master's idle pose is the follower joint's angle from its arm zero (turret and joint limits and the table still apply), the roll pot turns the wrist roll and the button opens and closes the gripper. *Set idle from master* captures the idle pose (master in the same pose as the follower at its arm zero), a Normal / Inverted switch per joint sets the directions, and the Manual tab draws the master's pose in amber, to check them before Control ON.
+
+**Teach & Replay** tab: with Control ON, *Record* makes the Teensy store what the follower is told; *Stop* (or Control OFF) saves the take on its SD card. *Play* turns Control OFF and lets the Teensy replay the loaded take by itself at the chosen speed, so a replay keeps going without the PC or the link; Control ON takes over again. The takes on the card are listed with a *Load* button each.
 
 **Radio link** (`ArduinoCode/libraries/TwinLink`): the two gateways pair through a 16-byte key kept in each one's flash. Send `#key <32 hex digits>` to each gateway's USB serial, the same key on both (`python -c "import secrets; print(secrets.token_hex(16))"` makes one); `#key` alone prints a fingerprint to compare, `#test` runs the protocol self-test. Each connection starts with a challenge-response on that key (HMAC-SHA256, the key never goes on air) and a fresh AES-128 session key. Every frame is AES-GCM encrypted and authenticated, and hops to the next of 7 channels (433.3–434.5 MHz, SF5 / 500 kHz, 28 slots a second, `#hello` round trip 63–78 ms on the bench); a piece of a line that does not get through goes again in the next slot, on the next channel. Build both gateway sketches with RadioLib and this folder on the library path (`arduino-cli compile --libraries ArduinoCode/libraries …`, or copy `TwinLink` into the Arduino IDE sketchbook's `libraries`).
 
@@ -511,10 +517,11 @@ prints overshoot, rise, settling, steady error and the fitted ωn / ζ / top spe
 
 **Designed in the report, next to build**
 
-- [ ] Master firmware: SSI encoder read-out, harmonic calibration look-up table, α–β tracker, 18-byte CRC-16 frames
-- [ ] LoRa link at SF5 / 500 kHz with the 50 ms watchdog
+- [x] Master firmware on a LightGateway: 4 MT6701 over I2C through a TCA9548A, wrist-roll pot, gripper toggle button, joint-space mapping from a captured idle pose
+- [ ] Master refinements: harmonic calibration look-up table, α–β tracker, mapping on the follower instead of the app
+- [x] LoRa link at SF5 / 500 kHz, encrypted and frequency-hopping, with a 500 ms link watchdog
 - [ ] Follower state machine: `INIT` · `HOLD` · `LIVE` · `RECORD` · `REPLAY` · `FAULT`
-- [ ] microSD recording, time-scaled replay and minimum-jerk transitions
+- [x] microSD recording, time-scaled replay and minimum-jerk transitions on the Teensy, driven from the app's Teach & Replay tab
 - [ ] Task-space mode with motion scaling and Damped Least Squares near singularities
 
 **Future improvements**

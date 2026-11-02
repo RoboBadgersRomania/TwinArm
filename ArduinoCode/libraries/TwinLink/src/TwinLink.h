@@ -35,7 +35,7 @@ const uint8_t SF = 5, CR = 5;                     // the fastest LoRa setting: a
 const uint16_t PREAMBLE = 12;                     // symbols: the SX126x needs 12 or more at SF5 / SF6
 const float TCXO_V = 1.8f;                        // the E22's 32 MHz TCXO, fed from DIO3 (EBYTE datasheet)
 const int8_t POWER_DBM = 10;                      // 10 mW, the EU limit in this band; the module goes to 22
-const size_t STATE_M = 10, STATE_F = 2;           // fixed bytes in every master / follower frame
+const size_t STATE_M = 11, STATE_F = 2;           // fixed bytes in every master / follower frame
 const size_t CHUNK_M = 48, CHUNK_F = 80;          // most stream bytes per master / follower frame
 const size_t HDR = 5, TAG = 8;                    // type + slot in the clear (but authenticated), GCM tag
 const uint32_t MARGIN_US = 6000, GUARD_US = 4000; // spare time per slot; the follower is on the next channel this early
@@ -48,18 +48,18 @@ inline void put16(uint8_t *b, uint16_t v) { b[0] = v; b[1] = v >> 8; }
 inline uint16_t get16(const uint8_t *b) { return b[0] | b[1] << 8; }
 inline uint32_t get32(const uint8_t *b) { return b[0] | b[1] << 8 | b[2] << 16 | (uint32_t)b[3] << 24; }
 
-// The master arm's state bytes (3 joints: 14-bit MT6701 angle, 0xFFFF = no reading; 2 pots: 12-bit ADC) as the app's
-// line M,<j1 deg>,<j2 deg>,<j3 deg>,<pot1 %>,<pot2 %>,<ok bits>, -1 for a joint without a reading.
+// The master arm's state bytes as the app's line M,<turret>,<shoulder>,<elbow>,<wrist pitch>,<roll pot %>,<gripper>,<ok>.
+// Bytes: 4 joints as 14-bit MT6701 angles (0xFFFF = no reading, -1 deg in the line), the wrist-roll pot as 12 bits,
+// the gripper (1 = closed). ok: one bit per joint that answered.
 inline void masterLine(const uint8_t *s, char *out, size_t n) {
-  float d[3];
+  float d[4];
   int ok = 0;
-  for (int j = 0; j < 3; j++) {
+  for (int j = 0; j < 4; j++) {
     uint16_t v = get16(s + 2 * j);
     ok |= (v != 0xFFFF) << j;
     d[j] = v == 0xFFFF ? -1 : v * 360.0f / 16384;
   }
-  snprintf(out, n, "M,%.2f,%.2f,%.2f,%.1f,%.1f,%d", d[0], d[1], d[2], get16(s + 6) * 100.0f / 4095,
-           get16(s + 8) * 100.0f / 4095, ok);
+  snprintf(out, n, "M,%.2f,%.2f,%.2f,%.2f,%.1f,%d,%d", d[0], d[1], d[2], d[3], get16(s + 8) * 100.0f / 4095, s[10], ok);
 }
 
 struct Ring {  // byte FIFO; the indices only grow, so used() stays right when they wrap

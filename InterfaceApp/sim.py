@@ -4,7 +4,8 @@ python sim.py, then python main.py 127.0.0.1. Speaks the same lines as the real 
 follows the console commands and sends T lines at 10 Hz. Each joint is a toy spring-damper driven by its
 position Kp and velocity Kp (g command), capped at its rpm, so step tests react to tuning.
 The elbow (#2) hits a fake obstacle at +70 deg and jams, with the same rule as checkJam on the Teensy.
-It also passes on a fake master arm (M lines, joint 3 without a reading) and a radio link that is up (L lines).
+It also passes on a fake master arm (M lines, the wrist sensor without a reading) and a radio link that is up (L lines),
+and has the Teensy's recorder: rec / stop / play / load / takes, with R and K lines (at 10 Hz, no move-in).
 
 python sim.py --model step_tests/model_fit.json   joints move like the real ones fitted by compare.py / the app's
 whole-arm test, starting with the gains they were measured with; changing gains scales the fit like a cascaded
@@ -25,6 +26,8 @@ motors = {i: {"deg": 0.0, "target": 0.0, "rpm": 10.0, "mode": 4, "temp": 31.0, "
 OBSTACLE = {2: 70.0}
 jam_cfg = [4.0, 400]  # tolerance deg, time ms (0 = off)
 backup = {}           # the gateway's flash gain backup: id -> 4 gains
+rec = {"state": "idle", "no": 0, "take": [], "t0": 0.0, "speed": 1.0}  # the Teensy's recorder, at the 10 Hz tick
+takes = {}            # its SD card: number -> samples ({CAN id: target} every 0.1 s)
 SIM_DROP_END = "--drop-end" in sys.argv  # lose every step test's end line, as a lossy WiFi might
 HIDDEN_CAP = {4: 15.0} if "--slow-roll" in sys.argv else {}  # deg/s the driver itself allows, whatever 'v' says
 MODEL = {}  # CAN id -> fitted real joint: kp, kv, vmax and the gains / speed limit it was measured with
@@ -62,7 +65,27 @@ def move(i, m, dt):
 
 def command(line):
     global pc
-    if line.startswith("#hello"):
+    f = line.split()
+    if rec["state"] == "play" and f and (f[0] in "xhtp" or len(f) > 1 and f[1][:1] in "arsho"):
+        rec["state"] = "idle"  # a manual move takes over from the replay, as on the Teensy
+    if line == "rec":
+        rec.update(state="rec", no=0, take=[], t0=time.monotonic())
+    elif line == "stop":
+        if rec["state"] == "rec":
+            rec["no"] = max(takes, default=0) + 1
+            takes[rec["no"]] = rec["take"]
+        rec["state"] = "idle"
+    elif line.startswith("play"):
+        if rec["take"]:
+            rec.update(state="play", t0=time.monotonic(), speed=float(line[4:] or 100) / 100)
+    elif line.startswith("load "):
+        if int(line[5:]) in takes:
+            rec.update(no=int(line[5:]), take=takes[int(line[5:])])
+    elif line == "takes":
+        for n, samples in sorted(takes.items()):
+            sock.sendto(("K,%d,%.2f\n" % (n, len(samples) / 10)).encode(), pc)
+        sock.sendto(("K,end,%d\n" % len(takes)).encode(), pc)
+    elif line.startswith("#hello"):
         sock.sendto(("G,%s,%d,-42\n" % (line.split()[1], time.monotonic() * 1000)).encode(), pc)
     elif line.startswith("#save "):
         p = line.split()
@@ -147,6 +170,17 @@ while True:
         m["temp"] += (31 + 9 * abs(m["amps"]) - m["temp"]) * dt / 40
     if pc and now >= next_tx:
         next_tx = now + 0.1
+        if rec["state"] == "rec":
+            rec["take"].append({i: m["target"] for i, m in motors.items()})
+        elif rec["state"] == "play":
+            k = int((now - rec["t0"]) * rec["speed"] * 10)
+            if k >= len(rec["take"]):
+                rec["state"] = "idle"
+            else:
+                for i, deg in rec["take"][k].items():
+                    motors[i].update(target=deg, mode=4)
+        at = len(rec["take"]) / 10 if rec["state"] == "rec" else (now - rec["t0"]) * rec["speed"] if rec["state"] == "play" else 0
+        sock.sendto(("R,%s,%d,%.2f,%.2f,1\n" % (rec["state"], rec["no"], at, len(rec["take"]) / 10)).encode(), pc)
         for i, m in motors.items():  # one line per datagram, like the gateway
             stuck = (m["mode"] and abs(m["target"] - m["deg"]) > jam_cfg[0]
                      and abs(m["deg"] - m["last"]) < min(0.25 * m["rpm"] * 6 * 0.1, 1.0))  # as checkJam on the Teensy
@@ -158,9 +192,11 @@ while True:
                 i, m["deg"] + random.gauss(0, 0.03), m["target"], m["amps"], m["temp"], 24.3 + random.gauss(0, 0.05),
                 abs(m["amps"]) * 0.32, m["mode"], m["fault"], m["jam"])
             sock.sendto(line.encode(), pc)
-        # the master arm over the radio, as the follower's gateway passes it on: slow sweeps, joint 3 unplugged
-        sock.sendto(("M,%.2f,%.2f,-1,%.1f,%.1f,3\n" % (180 + 60 * math.sin(now * 0.5), 90 + 40 * math.sin(now * 0.7),
-                                                     50 + 45 * math.sin(now * 0.3), 50 + 45 * math.sin(now * 0.2))).encode(), pc)
+        # the master arm over the radio, as the follower's gateway passes it on: slow sweeps, the wrist sensor
+        # unplugged, the gripper button pressed every 3 s
+        sock.sendto(("M,%.2f,%.2f,%.2f,-1,%.1f,%d,7\n" % (
+            180 + 60 * math.sin(now * 0.5), 90 + 40 * math.sin(now * 0.7), 200 + 30 * math.sin(now * 0.4),
+            50 + 45 * math.sin(now * 0.3), int(now / 3) % 2)).encode(), pc)
         if int(now) != int(now - 0.1):
             sock.sendto(b"L,f,1,31,%d,-48,9.0,-51,8.5,433.70\n" % random.randint(94, 100), pc)
     time.sleep(0.002)
