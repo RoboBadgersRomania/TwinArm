@@ -8,6 +8,8 @@
 //   <id> h       home one         1 h
 //   <id> o       release one      1 o
 //   <id> c       clear fault/jam  1 c   (shows the fault code left afterwards)
+//   <id> z       arm zero here    4 z   (where the joint is now becomes its 0, kept in EEPROM for every homing;
+//                answer Z,id,ok,offset from the driver origin)
 //   <id> g [pos kp ki vel kp ki]  read, or write then read, the driver's loop gains   1 g 20 0.5 3 0.1
 //   <id> m<amps> max current      1 m8
 //   <id> s<deg>  step test: move by deg from where it is, sample every 10 ms for 2 s, send the curve   1 s5
@@ -19,7 +21,7 @@
 //   stop         end the recording (saved as TAKEnnn.BIN) or the replay (the arm holds where it is)
 //   play <%>     replay the loaded take at this speed (10-200, 100 = as taught): a minimum-jerk move to its
 //                first pose, then the take, smoothed. A manual move (a r s h o t p x) or a jam stops it
-//   load <n>     load TAKEn from the card      takes   list the takes on the card
+//   load <n>     load TAKEn from the card      takes   list the takes on the card      del <n>  delete TAKEn
 // MPC for the replay, always on for joints with a model (JointMPC.h; the maths and a simulated comparison in
 // InterfaceApp/mpc.py). Models and lead are kept in EEPROM:
 //   mpc <id> <wn> <zeta>   the joint's model, from its step-test fit (the app sends model_fit.json)   mpc 2 14.9 0.52
@@ -53,8 +55,8 @@ void openTo(float pct) {            // 0 = closed, 100 = open, inside the hard l
   grip(lroundf(GRIPPER_CLOSED_US + gripPct * (GRIPPER_OPEN_US - GRIPPER_CLOSED_US) / 100));
 }
 
-Servo turret;                       // base turret: DS5180 80 kg servo, signal on pin 9, powered from its own supply
-const int TURRET_PIN = 9;
+Servo turret;                       // base turret: DS5180 80 kg servo, signal on pin 29, powered from its own supply
+const int TURRET_PIN = 29;          // held at the centre (1500 us, turn(0)) from boot until the app moves it
 const float TURRET_SPAN_DEG = 180;  // calibrate: degrees the turret turns between the 500 us and 2500 us pulses
 const int TURRET_MIN_US = 500, TURRET_MAX_US = 2500;  // hard limits: every pulse is clamped to these
 float turretDeg = 0;                // last commanded angle, for the recorder
@@ -75,7 +77,13 @@ const uint8_t IDS[] = {1, 2, 3, 4};
 const uint32_t CAN_BAUD = 1000000;  // driver default; must match the CAN baud set in the ZE300 GUI
 const float HOME_RPM = 10;          // calibrate: speed limit for the homing move (driver forgets it at power-off)
 const int MAX_ID = 4;
-const float HOME_OFFSET[MAX_ID + 1] = {0,0,5, 0, 45};  // [id]: degrees from driver origin to arm zero
+// [id]: degrees from driver origin to arm zero, by default, where the arm is straight (2026-11-03: with the zeros
+// before, the app's alignment dials read shoulder -23.3, elbow -0.6, wrist pitch -26.6 there; those dials show the
+// drawing's direction, sign x motor degrees, and shoulder and wrist pitch run inverted)
+const float HOME_OFFSET[MAX_ID + 1] = {0, 5.7f, 3.7f, 9.9f, 0.0f};  // then shoulder -18.3, elbow -0.7 (3D view); wrist roll at its driver origin
+float homeOffset[MAX_ID + 1];       // the offsets in use: HOME_OFFSET, or what '<id> z' measured (kept in EEPROM)
+float originDeg[MAX_ID + 1];        // driver angle where this boot's homing found the origin
+bool homed[MAX_ID + 1];             // the origin above is valid
 float zeroDeg[MAX_ID + 1];          // driver angle of each arm zero, set by homing
 float target[MAX_ID + 1];           // last commanded angle relative to the arm zero, reported as telemetry
 
@@ -124,12 +132,46 @@ void homeOne(uint8_t id) {
   rpmSet[id] = HOME_RPM;
   bus.setMaxSpeed(id, HOME_RPM);
   bool ok = bus.home(id) && waitStill(id);
+  homed[id] = ok;
   if (ok) {
-    zeroDeg[id] = bus.m[id].deg + HOME_OFFSET[id];
+    originDeg[id] = bus.m[id].deg;
+    zeroDeg[id] = originDeg[id] + homeOffset[id];
     target[id] = 0;
     ok = bus.moveTo(id, zeroDeg[id]);
   }
-  Serial.printf("motor %d: home %s\n", id, ok ? "ok" : "FAILED");
+  Serial.printf("motor %d: home %s, arm zero %.2f deg from the driver origin\n", id, ok ? "ok" : "FAILED", homeOffset[id]);
+}
+
+// ---------- arm zero calibration: '<id> z' makes where the joint is now its arm zero ----------
+// The offset from the driver origin is kept in EEPROM (after the MPC models) and used by every later homing,
+// so a gripper remounted or slipped on its shaft is calibrated once, without editing HOME_OFFSET.
+const int ZERO_ADDR = 128;
+const uint32_t ZERO_MAGIC = 0x314F525A;     // "ZRO1"
+struct ZeroStore { uint32_t magic; float off[MAX_ID + 1]; };
+
+void zeroLoad() {
+  ZeroStore st;
+  EEPROM.get(ZERO_ADDR, st);
+  for (uint8_t id : IDS)
+    homeOffset[id] = st.magic == ZERO_MAGIC && isfinite(st.off[id]) && fabsf(st.off[id]) < 720 ? st.off[id] : HOME_OFFSET[id];
+  if (st.magic == ZERO_MAGIC) Serial.println("arm zeros from EEPROM");
+}
+
+void zeroHere(uint8_t id) {                 // answer: Z,id,ok,offset from the driver origin
+  bool ok = homed[id] && !jammed[id] && bus.readPosition(id);
+  if (ok) {
+    homeOffset[id] = bus.m[id].deg - originDeg[id];
+    zeroDeg[id] = bus.m[id].deg;
+    target[id] = 0;
+    lastDeg[id] = 0;
+    ok = bus.moveTo(id, zeroDeg[id]);         // hold right here: it is the new 0
+    ZeroStore st = {ZERO_MAGIC, {}};
+    for (uint8_t i : IDS) st.off[i] = homeOffset[i];
+    EEPROM.put(ZERO_ADDR, st);
+  }
+  gateway.printf("Z,%d,%d,%.2f\n", id, ok, homeOffset[id]);
+  Serial.printf("motor %d: %s\n", id, ok ? "arm zero set here, kept for every homing" :
+                homed[id] ? "zero not set (no reply, or jammed)" : "zero not set: home it first");
 }
 
 // Position and velocity loop gains straight from the driver, to the app (P line) and the console.
@@ -164,12 +206,49 @@ void stepTest(uint8_t id, float deg, bool echo) {
   if (echo) Serial.printf("motor %d: step %+.1f deg captured, %d samples\n", id, deg, n);
 }
 
-// Gripper opens and closes once, settles at idle, then the motors home.
+// Every joint homes at the same time: all drivers get the home command together, the gripper opens and closes
+// once meanwhile, and once every joint has settled (or after 10 s) they all move on to their arm zero together.
+// The turret is not touched: it holds where it was told (the centre after boot). '<id> h' still homes one joint.
 void homeAll() {
-  grip(GRIPPER_OPEN_US);   delay(1000);
-  grip(GRIPPER_CLOSED_US); delay(1000);
-  openTo(GRIP_MID_PCT);
-  for (uint8_t id : IDS) homeOne(id);
+  bool started[MAX_ID + 1] = {}, still[MAX_ID + 1] = {};
+  float last[MAX_ID + 1];
+  for (uint8_t id : IDS) {
+    bus.status(id);                 // fresh fault state; a driver that was still booting at ping gets homed too
+    if (bus.m[id].fault) bus.clearFault(id);
+    jammed[id] = homed[id] = false;
+    stuckMs[id] = 0;
+    rpmSet[id] = HOME_RPM;
+    bus.setMaxSpeed(id, HOME_RPM);
+    last[id] = NAN;
+  }
+  for (uint8_t id : IDS) started[id] = bus.home(id);  // back to back: they start within a few ms of each other
+  grip(GRIPPER_OPEN_US);
+  int gripPhase = 0;
+  for (elapsedMillis t; t < 10000; delay(200)) {     // poll like waitStill: still = under 0.1 deg in 200 ms
+    if (gripPhase == 0 && t >= 1000) { grip(GRIPPER_CLOSED_US); gripPhase = 1; }
+    if (gripPhase == 1 && t >= 2000) { openTo(GRIP_MID_PCT); gripPhase = 2; }
+    bool all = true;
+    for (uint8_t id : IDS) {
+      if (!started[id] || still[id]) continue;
+      if (!bus.readPosition(id)) { started[id] = false; continue; }
+      if (fabsf(bus.m[id].deg - last[id]) < 0.1f) still[id] = true;
+      else all = false;
+      last[id] = bus.m[id].deg;
+    }
+    if (all && gripPhase == 2) break;
+  }
+  if (gripPhase < 2) openTo(GRIP_MID_PCT);
+  for (uint8_t id : IDS) {
+    bool ok = started[id] && still[id];
+    homed[id] = ok;
+    if (ok) {
+      originDeg[id] = last[id];
+      zeroDeg[id] = originDeg[id] + homeOffset[id];
+      target[id] = 0;
+      ok = bus.moveTo(id, zeroDeg[id]);
+    }
+    Serial.printf("motor %d: home %s, arm zero %.2f deg from the driver origin\n", id, ok ? "ok" : "FAILED", homeOffset[id]);
+  }
 }
 
 // ---------- teach and replay ----------
@@ -373,6 +452,16 @@ void listTakes() {                          // K,n,seconds for every take on the
   gateway.printf("K,end,%d\n", count);
 }
 
+void deleteTake(int n) {                    // del <n>: TAKEn off the card, then the list again
+  char name[16];
+  snprintf(name, sizeof name, "TAKE%03d.BIN", n);
+  bool ok = sdOk && rec == IDLE && SD.exists(name) && SD.remove(name);
+  if (ok && takeNo == n) takeNo = 0;        // its copy in RAM stays, as a take not saved
+  Serial.printf("take %d: %s\n", n, ok ? "deleted from the card" : rec != IDLE ? "not deleted while recording or replaying"
+                                                                             : "not found on the card");
+  listTakes();
+}
+
 void stopTake() {                           // ends a recording (and saves it) or a replay (the arm holds)
   if (rec == RECORDING) {
     rec = IDLE;
@@ -476,6 +565,7 @@ void setup() {
   turret.attach(TURRET_PIN);
   turn(0);
   mpcLoad();
+  zeroLoad();
   sdOk = SD.begin(BUILTIN_SDCARD);
   Serial.printf("SD card: %s\n", sdOk ? "ok, takes are saved there" : "NOT FOUND, takes only live in RAM");
   bus.begin(CAN_BAUD);
@@ -503,11 +593,12 @@ void command(String s, bool echo) {
     return;
   }
   if (s == "takes") return listTakes();
+  if (s.startsWith("del ")) return deleteTake(s.substring(4).toInt());
   if (s == "mpc" || s.startsWith("mpc ")) return mpcCommand(s.substring(3));
   int id; char op; float v = 0;
   bool joint = sscanf(s.c_str(), "%d %c%f", &id, &op, &v) >= 2;
   if (replaying() && (s.startsWith("t ") || s.startsWith("p ") || s == "x" || s == "h" ||
-                      (joint && strchr("arsho", op)))) {
+                      (joint && strchr("arshoz", op)))) {
     stopTake();                     // a manual move takes over from the replay
   }
   if (s.startsWith("t ")) {
@@ -541,6 +632,7 @@ void command(String s, bool echo) {
   if (s == "d") { bus.dump = !bus.dump; Serial.printf("frame dump %s\n", bus.dump ? "on" : "off"); return; }
   if (!joint || id < 1 || id > MAX_ID) { Serial.println("? see commands at top of sketch"); return; }
   if (op == 'h') { homeOne(id); return; }
+  if (op == 'z') { zeroHere(id); return; }
   if (op == 'g') {
     float k[4];
     if (sscanf(s.c_str(), "%*d g %f %f %f %f", &k[0], &k[1], &k[2], &k[3]) == 4)

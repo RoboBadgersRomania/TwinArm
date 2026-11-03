@@ -58,3 +58,9 @@ InterfaceApp/step_tests/
 
 # Tuning sessions from bench.py
 InterfaceApp/sessions/
+
+# Session logs from the app
+InterfaceApp/logs/
+
+# LaTeX build files of the report
+Documentation/build/

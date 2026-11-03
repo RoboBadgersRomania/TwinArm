@@ -14,11 +14,13 @@ Teensy -> PC   T,id,ok,deg,target,amps,tempC,volts,busAmps,mode,fault,jammed   o
                K,n,seconds ... K,end,count   the takes on the Teensy's SD card, answer to "takes"
                Q,on|off,lead,slowestUs,id:wn:zeta,...   the replay MPC, answer to "mpc ..." (wn 0 = no model)
                Q,test,ok,us   answer to "mpc test"
+               Z,id,ok,offset   answer to "<id> z": the joint's arm zero set where it is, offset from its driver origin
 gateway -> PC  M,turret,shoulder,elbow,wristPitch,rollPot%,gripClosed,okBits   the master arm 20 times a second:
                joints 0..360 deg (-1 no reading), the wrist-roll pot 0..100 %, the gripper button's state (1 closed)
                L,m|f,state,slots/s,ok%,rssi,snr,peerRssi,peerSnr,MHz   the radio once a second, seen from the master (m)
                or the follower (f); state -2 no radio, -1 no key, 0 searching, 1 up
 """
+import os
 import socket
 import time
 from collections import deque
@@ -68,6 +70,8 @@ class Link:
         self.captures = {}                   # CAN id -> last step test: start, target, dt, samples {i: deg}, done, at
         self.backup, self.backup_end = {}, None  # CAN id -> gains kept on the gateway; (motor count, time) of the last #load
         self.mpc, self.mpc_test = None, None  # the Teensy's replay MPC (last Q line), its last self-test
+        self.zeros = {}                      # CAN id -> answer to "<id> z": ok, offset from the driver origin, time
+        self.logf, self.log_t0 = None, 0.0   # session log: every line in (<) and out (>), seconds since connecting
 
     def connect(self, host, port=0):
         """A COM port (or /dev/tty...) is the master's gateway on USB; OSError if it cannot be opened."""
@@ -85,7 +89,23 @@ class Link:
             self.sock.setblocking(False)
         self.hello()
 
+    def start_log(self, path):
+        """Log every line from now on to path (one per line, "<seconds> <|> <line>"); OSError if it cannot be opened."""
+        self.stop_log()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.logf, self.log_t0 = open(path, "w", buffering=1, encoding="utf-8"), time.monotonic()
+
+    def stop_log(self):
+        if self.logf:
+            self.logf.close()
+        self.logf = None
+
+    def log(self, way, line):
+        if self.logf:
+            self.logf.write("%.3f %s %s\n" % (time.monotonic() - self.log_t0, way, line))
+
     def close(self):
+        self.stop_log()
         if self.sock:
             self.sock.close()
         if self.ser:
@@ -96,6 +116,8 @@ class Link:
     def send(self, *lines):
         if not lines:
             return
+        for ln in lines:
+            self.log(">", ln)
         data = ("\n".join(lines) + "\n").encode()
         try:
             if self.ser:
@@ -132,6 +154,7 @@ class Link:
             self.handle(line.decode(errors="replace").strip(), t)
 
     def handle(self, line, t):
+        self.log("<", line)
         f = line.split(",")
         try:
             if f[0] == "G" and len(f) >= 4:
@@ -175,7 +198,8 @@ class Link:
             elif f[0] == "M" and len(f) == 8:
                 ok = int(f[7])
                 self.master = {"deg": [float(v) for v in f[1:5]], "ok": [bool(ok >> j & 1) for j in range(4)],
-                               "roll": float(f[5]), "grip": f[6] == "1", "seen": t}
+                               "roll": float(f[5]), "grip": bool(int(f[6]) & 1), "grip_held": bool(int(f[6]) & 2),
+                               "seen": t}  # grip: this press closes (else opens); grip_held: the button is down
             elif f[0] == "R" and len(f) == 6:
                 self.take = {"state": f[1], "no": int(f[2]), "at": float(f[3]), "len": float(f[4]), "sd": f[5] == "1",
                              "seen": t}
@@ -190,6 +214,8 @@ class Link:
                     if float(wn) > 0:
                         models[int(cid)] = (float(wn), float(zeta))
                 self.mpc = {"on": f[1] == "on", "lead": float(f[2]), "us": int(f[3]), "models": models, "seen": t}
+            elif f[0] == "Z" and len(f) == 4 and int(f[1]) in self.motors:
+                self.zeros[int(f[1])] = {"ok": f[2] == "1", "offset": float(f[3]), "seen": t}
             elif f[0] == "L" and len(f) == 10:
                 self.radio = {"role": f[1], "state": int(f[2]), "rate": int(f[3]), "ok": int(f[4]), "rssi": float(f[5]),
                               "snr": float(f[6]), "peer_rssi": float(f[7]), "peer_snr": float(f[8]), "mhz": float(f[9]),
@@ -253,6 +279,9 @@ if __name__ == "__main__":
     link.feed(b"M,12.50,-1,300.25,90.00,48.2,1,13\r\nL,m,1,31,97,-42,9.5,-45,8.8,433.70\nT,1,1,1", time.monotonic())
     assert link.master_online() and link.master["ok"] == [True, False, True, True] and link.master["deg"][2] == 300.25
     assert link.master["roll"] == 48.2 and link.master["grip"] and link.radio_status()["state"] == 1
+    assert not link.master["grip_held"]
+    link.handle("M,1,1,1,1,50.0,2,15", time.monotonic())  # (rx still holds an unfinished T line here)
+    assert link.master["grip_held"] and not link.master["grip"]  # held, opening
     assert link.radio["mhz"] == 433.7
     assert link.rx == b"T,1,1,1"  # the unfinished line waits for the rest
     link.feed(b",12.50,15.00,0.520,38,24.10,0.31,4,5,0\n", time.monotonic())
@@ -263,4 +292,6 @@ if __name__ == "__main__":
     link.feed(b"Q,on,25.0,1480,1:0.00:0.00,2:6.20:0.77,3:5.10:0.90,4:0.00:0.00\r\nQ,test,1,365\n", time.monotonic())
     assert link.mpc["on"] and link.mpc["lead"] == 25 and link.mpc["us"] == 1480
     assert link.mpc["models"] == {2: (6.2, 0.77), 3: (5.1, 0.9)} and link.mpc_test["ok"] and link.mpc_test["us"] == 365
+    link.feed(b"Z,2,1,37.50\n", time.monotonic())
+    assert link.zeros[2]["ok"] and link.zeros[2]["offset"] == 37.5
     print("link ok")

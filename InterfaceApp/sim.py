@@ -82,6 +82,9 @@ def command(line):
     elif line.startswith("load "):
         if int(line[5:]) in takes:
             rec.update(no=int(line[5:]), take=takes[int(line[5:])])
+    elif line.startswith("del "):
+        takes.pop(int(line[4:]), None)
+        command("takes")
     elif line == "takes":
         for n, samples in sorted(takes.items()):
             sock.sendto(("K,%d,%.2f\n" % (n, len(samples) / 10)).encode(), pc)
@@ -125,6 +128,12 @@ def command(line):
             return
         c, v = op[0], float(op[1:] or 0)
         if c in "ars" and m["jam"]:
+            return
+        if c == "z":  # arm zero here: the sim's angle restarts from 0 where the joint is
+            m.setdefault("offset", 0.0)
+            m["offset"] += m["deg"]
+            m["deg"], m["target"], m["last"] = 0.0, 0.0, 0.0
+            sock.sendto(("Z,%s,1,%.2f\n" % (i, m["offset"])).encode(), pc)
             return
         if c == "s":  # step test like stepTest on the Teensy: 2 s every 10 ms, simulated ahead in 1 ms steps
             start = m["deg"]
@@ -203,7 +212,7 @@ while True:
         # unplugged, the gripper button pressed every 3 s
         sock.sendto(("M,%.2f,%.2f,%.2f,-1,%.1f,%d,7\n" % (
             180 + 60 * math.sin(now * 0.5), 90 + 40 * math.sin(now * 0.7), 200 + 30 * math.sin(now * 0.4),
-            50 + 45 * math.sin(now * 0.3), int(now / 3) % 2)).encode(), pc)
+            50 + 45 * math.sin(now * 0.3), int(now / 6) % 2 | (now % 6 < 3) << 1)).encode(), pc)
         if int(now) != int(now - 0.1):
             sock.sendto(b"L,f,1,31,%d,-48,9.0,-51,8.5,433.70\n" % random.randint(94, 100), pc)
     time.sleep(0.002)
