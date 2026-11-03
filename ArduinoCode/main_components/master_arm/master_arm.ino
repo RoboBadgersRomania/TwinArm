@@ -3,7 +3,7 @@
 // Sensors: a TCA9548A at 0x70 on either I2C header (SDA IO3, SCL IO4, 3V3, GND; A0..A2 to GND), one MT6701 per
 //          channel: SD0 / SC0 turret (base left / right), SD1 / SC1 shoulder, SD2 / SC2 elbow, SD4 / SC4 wrist pitch.
 //          Wrist-roll potentiometer (the gripper turning on its axis): outer legs on 3V3 and GND, wiper on GPIO1.
-//          Gripper button between GPIO7 and GND: a toggle, each press closes the gripper, the next opens it.
+//          Gripper button between GPIO7 and GND: held, it turns the gripper; each press the other way.
 // USB serial 115200, where the app connects when its gateway field says COMxx:
 //   out  M,<turret>,<shoulder>,<elbow>,<wrist pitch>,<roll pot %>,<gripper 1 = closed>,<ok bits>   20 times a second;
 //        joints 0..360 deg, -1 = no reading
@@ -60,6 +60,7 @@ int readRaw() {
 // a mean over whole periods cancels it, where a single reading or a 50 ms mean does not. #pot shows the window.
 const int POT_MAX = 64;
 const uint32_t POT_WINDOW_US = 40000;
+const uint16_t POT_SPREAD_MAX = 490;     // 12 % of the travel inside 40 ms: the wiper lost its track (normal: ~3 %)
 uint16_t potV[POT_MAX];
 uint32_t potT[POT_MAX];
 int potHead = 0, potCount = 0;
@@ -86,6 +87,7 @@ uint16_t potMean(uint16_t *lo = nullptr, uint16_t *hi = nullptr, int *n = nullpt
     k++;
   }
   if (lo) *lo = mn, *hi = mx, *n = k;
+  if (k && mx - mn > POT_SPREAD_MAX) return 0xFFFF;  // no reading: the radio sends roll -1, the app holds the wrist
   return k ? (sum + k / 2) / k : analogRead(ROLL_POT);
 }
 
@@ -93,7 +95,7 @@ void potReport() {  // #pot: the window's readings oldest first, their spread an
   uint16_t lo, hi;
   int n;
   uint16_t m = potMean(&lo, &hi, &n);
-  Serial.printf("pot: last %lu ms, %d readings, min %u, max %u (spread %.1f %% of the travel), mean %u (of 4095)\n"
+  Serial.printf("pot: last %lu ms, %d readings, min %u, max %u (spread %.1f %% of the travel), mean %u (of 4095, 65535 = no contact)\n"
                 "pot in order, about 1 ms apart:", (unsigned long)(POT_WINDOW_US / 1000), n, lo, hi,
                 (hi - lo) * 100.0f / 4095, m);
   for (int i = n - 1; i >= 0; i--) Serial.printf(" %u", potV[(potHead - 1 - i + POT_MAX) % POT_MAX]);
@@ -118,15 +120,17 @@ void scan() {  // #scan: which mux channels have an MT6701, for checking the wir
   }
 }
 
-void readButton() {  // a press (to GND) toggles the gripper, straight into the next radio frame
+// The gripper button (to GND) turns the gripper only while it is held: each press turns it the other way than
+// the last, closing then opening. Its state byte: bit 0 = closing (else opening), bit 1 = held.
+void readButton() {
   static bool was = HIGH;
   static uint32_t changedAt = 0;
   bool now = digitalRead(GRIP_BUTTON);
   if (now == was || millis() - changedAt < DEBOUNCE_MS) return;
   changedAt = millis();
   was = now;
-  if (now == LOW) gripClosed = !gripClosed;
-  lora.state[2 * NJ + 2] = gripClosed;
+  if (now == LOW) gripClosed = !gripClosed;  // the direction of this press
+  lora.state[2 * NJ + 2] = gripClosed | (now == LOW) << 1;
 }
 
 void setup() {

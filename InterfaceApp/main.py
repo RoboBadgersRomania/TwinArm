@@ -36,6 +36,16 @@ JOINTS = [  # name, CAN driver id, graph colour; the first three are the side-vi
 ]
 TOP, SIDE, BAR = 60, 92, 64  # top bar height, sidebar width, control bar height
 ALIGN_H = 112  # the master / follower alignment strip on the Manual tab
+AXIS_X, AXIS_Y, AXIS_Z = (230, 72, 77), (96, 196, 120), (90, 140, 245)  # as Blender / Fusion colour them
+CAM_HOME = (-60.0, 24.0)  # azimuth, elevation (deg) of the 3D view's home: front-right, a little above
+CUBE_FACES = {  # name: (outward normal, corners, view (azimuth, elevation) it snaps to); X forward, Y left, Z up
+    "TOP": ((0, 0, 1), [(-1, -1, 1), (1, -1, 1), (1, 1, 1), (-1, 1, 1)], (-90.0, 89.9)),
+    "BOTTOM": ((0, 0, -1), [(-1, -1, -1), (-1, 1, -1), (1, 1, -1), (1, -1, -1)], (-90.0, -89.9)),
+    "FRONT": ((0, -1, 0), [(-1, -1, -1), (1, -1, -1), (1, -1, 1), (-1, -1, 1)], (-90.0, 0.0)),
+    "BACK": ((0, 1, 0), [(1, 1, -1), (-1, 1, -1), (-1, 1, 1), (1, 1, 1)], (90.0, 0.0)),
+    "RIGHT": ((1, 0, 0), [(1, -1, -1), (1, 1, -1), (1, 1, 1), (1, -1, 1)], (0.0, 0.0)),
+    "LEFT": ((-1, 0, 0), [(-1, 1, -1), (-1, -1, -1), (-1, -1, 1), (-1, 1, 1)], (180.0, 0.0)),
+}
 GRIP_IDLE = 23  # "p" value where the Teensy parks the gripper: GRIPPER_MID_US 1500 on its 1350..2000 us scale
 
 DEFAULTS = {
@@ -51,13 +61,15 @@ DEFAULTS = {
     "table": 110,                               # mm from the shoulder axis down to the table: tip never goes below
     "limit": 150, "turret_limit": 90,           # +- degrees from the arm zero
     "turret_rate": 60,                          # deg/s at 100 % while A/D is held (W/S runs at the joint speed)
-    "grip_rate": 50,                            # % of the gripper stroke per s while Space/Ctrl is held (not scaled)
+    "grip_rate": 30,                            # % of the gripper stroke per s: the master's button and Space/Ctrl
+    "grip_close": 0,                            # % open the gripper closes to (button, Space): above 0 grips softer
     "rpm_max": 30,                              # joint move speed at 100 %, sent with Control ON (drivers forget it at power-off)
     "roll_dps": 60,                             # deg/s the wrist roll motor spins at (its driver's limit, Q/E drive it)
     "roll_units": 8,                            # roll driver rpm per output rpm: it counts motor rpm, before the 8:1 gear
     "speed": 30,                                # %, the Speed field: scales the joints and the turret
     "pickup": 5,                                # deg: following, a joint only starts copying the master this close
     "roll_offset": 90,                          # deg: the master's roll (from roll_zero) at the follower's neutral 0
+    "roll_travel": 270,                         # deg of master roll over the pot's whole travel (Set roll +90° measures it)
     "jam_err": 4, "jam_ms": 400, "jam_on": 1,   # jam detection on the Teensy: tolerance deg, time ms, switch
     "tuning": {},                               # "<CAN id>": [pos kp, pos ki, vel kp, vel ki, max amps] as typed
     "window": 20,                               # graph history, s
@@ -75,11 +87,13 @@ ROWS = [  # label, key[, step, min, max]; no step = toggle, key None = section t
     ("Motion", None),
     ("Joint limit (± ° from zero)", "limit", 5, 10, 180), ("Turret limit (± °)", "turret_limit", 5, 10, 135),
     ("Turret speed at 100 %, A / D (°/s)", "turret_rate", 5, 5, 180),
-    ("Gripper speed, Space / Ctrl (%/s)", "grip_rate", 5, 5, 200),
+    ("Gripper speed: button, Space / Ctrl (%/s)", "grip_rate", 5, 5, 200),
+    ("Gripper closes to (% open)", "grip_close", 5, 0, 80),
     ("Joint speed at 100 % (rpm)", "rpm_max", 1, 1, 60),
     ("Wrist roll motor speed (°/s)", "roll_dps", 5, 5, 360),
     ("Follow pick-up window (± °)", "pickup", 1, 1, 30),
     ("Master roll at follower's 0 (°)", "roll_offset", 5, -180, 180),
+    ("Roll pot travel (°)", "roll_travel", 10, 60, 1000),
     ("Roll driver rpm per output rpm", "roll_units", 1, 1, 50),
     ("Display", None),
     ("Graph window (s)", "window", 5, 5, 120), ("Mirror view (arm faces left)", "mirror"),
@@ -87,7 +101,7 @@ ROWS = [  # label, key[, step, min, max]; no step = toggle, key None = section t
 GAIN_NAMES = ("Position Kp", "Position Ki", "Velocity Kp", "Velocity Ki")  # tune.py's gain index order
 CALIBRATION = {"zero1", "zero2", "zero3", "sign1", "sign2", "sign3", "sign4", "sign_t", "sign_g", "sign_pr"}
 MASTER_JOINTS = (("Turret", 0), ("Shoulder", 1), ("Elbow", 2), ("Wrist pitch", 4))  # the master's MT6701s, mux channel
-ROLL_POT_TRAVEL = 270  # degrees the master's roll pot turns end to end (its reading at idle is the roll zero)
+POT_JUMP = 25  # % of the pot's travel between two 50 ms readings (about 1350 deg/s): the pot jumped, not the hand
 POT_ALPHA, POT_BAND = 0.25, 0.6  # roll pot low-pass per 20 Hz reading, and hysteresis in % (0.6 % = 1.6° of roll)
 
 
@@ -138,6 +152,38 @@ def wrap_text(s, size, width):
     return lines + [cur]
 
 
+def dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0])
+
+
+def hull(pts):
+    """Convex hull of 2D points (monotone chain), counter-clockwise."""
+    pts = sorted(set((round(x, 2), round(y, 2)) for x, y in pts))
+    if len(pts) < 3:
+        return pts
+
+    def half(seq):
+        out = []
+        for p in seq:
+            while len(out) >= 2 and ((out[-1][0] - out[-2][0]) * (p[1] - out[-2][1]) -
+                                     (out[-1][1] - out[-2][1]) * (p[0] - out[-2][0])) <= 0:
+                out.pop()
+            out.append(p)
+        return out
+    lo, hi = half(pts), half(pts[::-1])
+    return lo[:-1] + hi[:-1]
+
+
+def inside(p, poly):
+    """Point in a convex polygon, either winding."""
+    sides = [(b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]) for a, b in zip(poly, poly[1:] + poly[:1])]
+    return all(v >= 0 for v in sides) or all(v <= 0 for v in sides)
+
+
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
@@ -171,6 +217,15 @@ def icon_tune(s, c, col):
     for dx, ky in ((-7, 4), (0, -5), (7, 1)):  # three sliders
         pygame.draw.line(s, col, (x + dx, y - 11), (x + dx, y + 11), 2)
         pygame.draw.circle(s, col, (x + dx, y + ky), 3.5)
+
+
+def icon_trash(s, c, col):
+    x, y = c
+    pygame.draw.line(s, col, (x - 7, y - 6), (x + 7, y - 6), 2)  # lid
+    pygame.draw.line(s, col, (x - 2, y - 8), (x + 2, y - 8), 2)  # handle
+    pygame.draw.polygon(s, col, [(x - 6, y - 4), (x + 6, y - 4), (x + 5, y + 8), (x - 5, y + 8)], 2)
+    for dx in (-2, 2):
+        pygame.draw.line(s, col, (x + dx, y - 1), (x + dx, y + 5), 1)
 
 
 def icon_replay(s, c, col):
@@ -227,6 +282,15 @@ class App:
         self.pick_last = {}             # the same at the previous tick, to catch the master going past
         self.fit_cache, self.mpc_at = (None, {}), 0.0  # model_fit.json (mtime, models); last MPC sync
         self.pot_seen, self.pot_f, self.pot_held = None, None, None  # the roll pot, low-passed and with hysteresis
+        self.pot_last = []              # its last 3 readings, for the spike median
+        self.pot_prev = self.pot_cand = None  # last accepted reading; a jump waiting for its second frame
+        self.pot_jumped = False         # a jump that stayed: the wrist roll has to be picked up again
+        self.del_armed = (None, 0.0)    # first click of a take's delete: number, time
+        self.roll90_armed = 0.0         # first click of Set roll +90°
+        self.zero_armed = (None, 0.0)   # first click of Set zero: CAN id, time
+        self.cam, self.cam_goal = list(CAM_HOME), None  # 3D view (radio): azimuth, elevation; a view it eases to
+        self.zoom3d, self.orbit, self.area3d, self.view3d = 1.0, None, None, (0, 0, 1)
+        self.zeros_seen = 0.0           # newest "<id> z" answer already shown
         self.hits, self.view, self.tip_px, self.cursor, self.layer = [], (0, 0, 1, 1), None, None, None
         self.card_pick = {}             # chosen spot per info card, kept while it stays clear
         self.ports, self.ports_at = [], 0.0  # USB serial ports seen, for the Connection panel
@@ -257,13 +321,14 @@ class App:
         return (self.follow or self.link.ser is not None) and self.link.master_online()
 
     def master_grip(self):
-        """% open the master's gripper button asks for: each press closes or opens it fully."""
-        return 0.0 if self.link.master["grip"] else 100.0
+        """% open the master's gripper button asks for: each press opens it fully or closes it to grip_close, so a
+        digital servo is not left stalled at full force on an object (it buzzes, then its overload protection lets go)."""
+        return float(self.cfg["grip_close"]) if self.link.master["grip"] else 100.0
 
     def master_roll(self):
         """The master's wrist roll, degrees from its pot's zero reading (roll_zero), filtered."""
         pot = self.link.master["roll"] if self.pot_held is None else self.pot_held
-        return self.cfg["sign_pr"] * (pot - self.cfg["roll_zero"]) / 100 * ROLL_POT_TRAVEL
+        return self.cfg["sign_pr"] * (pot - self.cfg["roll_zero"]) / 100 * self.cfg["roll_travel"]
 
     def pot_roll(self):
         """Wrist roll the master asks of the follower, degree for degree, inside the joint limit: the master at
@@ -290,7 +355,23 @@ class App:
         ms = self.link.master
         if not ms or ms["seen"] == self.pot_seen:
             return
-        self.pot_seen, p = ms["seen"], ms["roll"]
+        self.pot_seen = ms["seen"]
+        if not 0 <= ms["roll"] <= 100.5:  # -1: the master saw its wiper off the track (an older follower gateway
+            return                        # forwards that as ~1600 %): keep the last good reading
+        p = ms["roll"]
+        prev, cand = self.pot_prev, self.pot_cand
+        if cand is None and prev is not None and abs(p - prev) > POT_JUMP:
+            self.pot_cand = p  # no hand moves that far in 50 ms: wait one frame to tell a spike from a jump
+            return
+        if cand is not None:
+            self.pot_cand = None
+            if abs(p - cand) < 5 and abs(p - prev) > POT_JUMP:  # it stays there: the pot jumped (its end, contact)
+                self.pot_jumped = True                           # the wrist holds and picks up again
+                self.pot_last, self.pot_f, self.pot_held, self.pot_prev = [p], p, p, p
+                return
+        self.pot_prev = p
+        self.pot_last = (self.pot_last + [p])[-3:]
+        p = sorted(self.pot_last)[len(self.pot_last) // 2]  # a single-frame jump (a wiper losing contact) is dropped
         self.pot_f = p if self.pot_f is None else self.pot_f + POT_ALPHA * (p - self.pot_f)
         if self.pot_held is None:
             self.pot_held = self.pot_f
@@ -397,7 +478,8 @@ class App:
                     self.g, self.tool = g, sum(g)  # a drag afterwards keeps this wrist angle
             ctrl = k[pygame.K_LCTRL] or k[pygame.K_RCTRL]
             if not fol:
-                self.grip = clamp(self.grip + (ctrl - k[pygame.K_SPACE]) * self.cfg["grip_rate"] * dt, 0, 100)
+                self.grip = clamp(self.grip + (ctrl - k[pygame.K_SPACE]) * self.cfg["grip_rate"] * dt,
+                                  min(self.grip, self.cfg["grip_close"]), 100)  # Space stops at grip_close
         if fol:  # a copy of the master: encoders -> joints and turret, roll pot -> wrist roll, button -> gripper
             self.waiting = {}
             want = self.master_pose()
@@ -409,9 +491,17 @@ class App:
             if t is not None and self.pick_up("t", clamp(t, -tl, tl), self.turret):
                 self.turret = clamp(t, -tl, tl)
             roll = self.pot_roll()
+            if self.pot_jumped:  # the pot jumped (past its end, or contact): the wrist holds until the master is back
+                self.pot_jumped = False
+                if "r" in self.engaged:
+                    self.engaged.discard("r")
+                    self.pick_last.pop("r", None)
+                    self.toast("Roll pot jumped: the wrist holds until the master comes back to it")
             if self.pick_up("r", roll, self.roll):
                 self.roll = roll
-            self.grip = self.master_grip()
+            if self.link.master.get("grip_held"):  # only while the button is held: closing, or opening, by press
+                step = self.cfg["grip_rate"] * dt
+                self.grip += clamp(self.master_grip() - self.grip, -step, step)
         targets = {JOINTS[i][1]: self.motor(i, self.g[i]) for i in range(3)}
         targets[JOINTS[3][1]] = self.cfg["sign4"] * self.roll
         targets["t"] = self.cfg["sign_t"] * self.turret
@@ -440,6 +530,11 @@ class App:
         except OSError:
             self.toast("Cannot open %s: wrong port, or busy (close the Arduino serial monitor)" % host)
             return
+        try:  # a session log of every line, to look at afterwards (InterfaceApp/logs/, kept out of git)
+            self.link.start_log(os.path.join(HERE, "logs", "%s_%s.log" % (
+                time.strftime("%Y%m%d_%H%M%S"), "".join(ch if ch.isalnum() else "-" for ch in host))))
+        except OSError:
+            pass
         self.cfg.update(host=host, port=int(port) if port.isdigit() else self.cfg["port"])
         save(self.cfg)
         self.connected, self.hello_at = True, time.monotonic()
@@ -557,6 +652,23 @@ class App:
         if not quiet:
             self.toast("Applied to motor #%d" % cid)
         return True
+
+    def zero_motor(self, cid):
+        """Where the joint is now becomes its arm zero, kept by the Teensy for every homing (a gripper that slipped
+        or was remounted). Two clicks, Control OFF: the app's targets would otherwise jump with the new zero."""
+        name = next(j[0] for j in JOINTS if j[1] == cid)
+        if self.control:
+            self.toast("Control OFF first: set zero changes what 0 means for the %s" % name.lower())
+            return
+        if not self.link.robot_online():
+            self.toast("No telemetry from the arm: connect first")
+            return
+        if self.zero_armed[0] != cid or time.monotonic() - self.zero_armed[1] > 2:
+            self.zero_armed = (cid, time.monotonic())
+            self.toast("Click again within 2 s: the %s's position now becomes its 0, for every homing" % name.lower())
+            return
+        self.zero_armed = (None, 0.0)
+        self.link.send("%d z" % cid)
 
     def apply_all(self):
         done = sum(self.apply_motor(j[1], quiet=True) for j in JOINTS)
@@ -760,6 +872,17 @@ class App:
     def load_take(self, n):
         self.link.send("load %d" % n)
 
+    def delete_take(self, n):
+        """TAKEn off the Teensy's card. Two clicks: the second within 2 s deletes."""
+        if self.del_armed[0] != n or time.monotonic() - self.del_armed[1] > 2:
+            self.del_armed = (n, time.monotonic())
+            self.toast("Click Delete within 2 s: take %d is removed from the SD card for good" % n)
+            return
+        self.del_armed = (None, 0.0)
+        self.link.takes.pop(n, None)
+        self.link.send("del %d" % n)  # the Teensy answers with the list again
+        self.toast("Take %d deleted" % n)
+
     def refresh_takes(self):
         self.link.takes.clear()  # the answer lists them all again; a take deleted from the card disappears
         self.link.send("takes", "mpc")  # and the replay MPC's state
@@ -839,6 +962,36 @@ class App:
         self.fields["speed"] = str(self.cfg["speed"])
         save(self.cfg)
 
+    def capture_roll90(self):
+        """With the master's roll turned 90° from its neutral, the way the follower should turn positive: its pot
+        reading sets the degrees per % of the pot and the direction, so a large turn maps as far as a small one."""
+        ms = self.link.master if self.link.master_online() else None
+        if not ms:
+            self.toast("No master readings: connect first")
+            return
+        if time.monotonic() - self.roll90_armed > 2:
+            self.roll90_armed = time.monotonic()
+            self.toast("Turn the master's roll 90° from neutral (the way the follower should turn +), click again within 2 s")
+            return
+        self.roll90_armed = 0.0
+        pot = ms["roll"] if self.pot_f is None else self.pot_f  # low-passed, without the hysteresis
+        self.pot_held = pot
+        trav, sgn, off = self.cfg["roll_travel"], self.cfg["sign_pr"], self.cfg["roll_offset"]
+        neutral = self.cfg["roll_zero"] + sgn * off / trav * 100  # pot % at the follower's 0
+        dp = pot - neutral
+        travel = 90 / abs(dp) * 100 if abs(dp) >= 3 else 0
+        if not 60 <= travel <= 1000:
+            self.toast("The pot moved %.1f %% from neutral (%.1f %%): Set idle from master first, then turn 90°" % (dp, neutral))
+            return
+        if self.control:
+            self.set_control(False, "Control OFF: roll calibrated")
+        sign = 1 if dp > 0 else -1
+        self.cfg.update(roll_travel=round(travel, 1), sign_pr=sign,
+                        roll_zero=round(neutral - sign * off / travel * 100, 2))
+        save(self.cfg)
+        self.toast("Roll pot: %.0f° over its whole travel (was %.0f°), %s; neutral stays at %.1f %%"
+                   % (travel, trav, "normal" if sign > 0 else "inverted", neutral))
+
     def capture_idle(self):
         """The master's pose now is the follower's idle (arm zero): its readings become the zero. Two clicks."""
         ms = self.link.master if self.link.master_online() else None
@@ -857,8 +1010,9 @@ class App:
         if self.control:
             self.set_control(False, "Control OFF: idle set from the master")
         self.cfg["master_zero"] = [round(d, 2) for d in ms["deg"]]
-        pot = ms["roll"] if self.pot_held is None else self.pot_held  # the master's roll now is the follower's 0:
-        self.cfg["roll_zero"] = round(pot - self.cfg["sign_pr"] * self.cfg["roll_offset"] / ROLL_POT_TRAVEL * 100, 1)
+        pot = ms["roll"] if self.pot_f is None else self.pot_f  # low-passed, without the hysteresis: the follower's 0
+        self.pot_held = pot  # and the hysteresis starts from it, so the follower reads 0 right away
+        self.cfg["roll_zero"] = round(pot - self.cfg["sign_pr"] * self.cfg["roll_offset"] / self.cfg["roll_travel"] * 100, 2)
         save(self.cfg)                                                # so it reads roll_offset (+90°) there
         self.toast("Idle set: turret %.2f°, shoulder %.2f°, elbow %.2f°, wrist %.2f°, roll pot %.1f %%"
                    % tuple(self.cfg["master_zero"] + [self.cfg["roll_zero"]]))
@@ -898,8 +1052,20 @@ class App:
                 self.panel = None
             elif self.control and self.tab == 0 and self.tip_px and math.dist(e.pos, self.tip_px) < 24:
                 self.drag, self.drag_mm = True, self.to_mm(e.pos)
+            elif self.tab == 0 and self.area3d and self.area3d.collidepoint(e.pos):
+                face = self.cube_face(e.pos)
+                if face:
+                    self.cam_goal = list(CUBE_FACES[face][2])
+                else:
+                    self.orbit, self.cam_goal = e.pos, None
         elif e.type == pygame.MOUSEBUTTONUP and e.button == 1:
-            self.drag = False
+            self.drag, self.orbit = False, None
+        elif e.type == pygame.MOUSEMOTION and self.orbit:
+            self.cam[0] -= 0.4 * (e.pos[0] - self.orbit[0])
+            self.cam[1] = clamp(self.cam[1] + 0.4 * (e.pos[1] - self.orbit[1]), -89.9, 89.9)
+            self.orbit = e.pos
+        elif e.type == pygame.MOUSEWHEEL and self.tab == 0 and self.link.ser is not None:
+            self.zoom3d = clamp(self.zoom3d * 1.1 ** e.y, 0.4, 4.0)
         elif e.type == pygame.MOUSEMOTION and self.drag:
             self.drag_mm = self.to_mm(e.pos)
             self.solve(self.drag_mm)
@@ -960,6 +1126,12 @@ class App:
                     self.fields["t%d_%d" % (cid, k)] = "%g" % v
             self.toast("Backup of %d motors in the fields: Apply all writes it to the drivers" % end[0] if end[0]
                        else "No backup on the gateway yet: press Back up first")
+        for cid, z in self.link.zeros.items():  # the Teensy's answer to Set zero
+            if z["seen"] > self.zeros_seen:
+                self.zeros_seen = z["seen"]
+                name = next(j[0] for j in JOINTS if j[1] == cid)
+                self.toast("%s: zero set here, %.2f° from its driver origin, kept for every homing" % (name, z["offset"])
+                           if z["ok"] else "%s: zero not set (home it first, or it is jammed)" % name)
         if self.link.jam_at > self.jam_seen:
             self.jam_seen = self.link.jam_at
             deg, ms = self.link.jam_cfg
@@ -1117,6 +1289,43 @@ class App:
         area = pygame.Rect(c.x, c.y, c.w, c.h - BAR - (ALIGN_H if strip else 0))
         if strip:
             self.draw_align(surf, pygame.Rect(c.x + 14, area.bottom, c.w - 28, ALIGN_H - 8))
+        if self.link.ser is not None:  # over the radio: a 3D view (the master drives, there is no tip to drag)
+            self.tip_px = None
+            self.draw_scene3d(surf, area)
+        else:
+            self.area3d = None
+            self.draw_scene2d(surf, area)
+
+        bar = pygame.Rect(c.x, c.bottom - BAR, c.w, BAR)
+        pygame.draw.line(surf, LINE, (bar.x + 14, bar.y), (bar.right - 14, bar.y))
+        x, y, h = bar.x + 14, bar.y + 12, 40
+        self.button(surf, pygame.Rect(x, y, 176, h), "CONTROL  ON" if self.control else "CONTROL  OFF",
+                    lambda: self.set_control(not self.control), "on" if self.control else "plain", 15, True)
+        x += 186
+        self.button(surf, pygame.Rect(x, y, 80, h), "Idle", self.idle)
+        x += 90
+        self.button(surf, pygame.Rect(x, y, 96, h), "Home all", self.home)
+        x += 106
+        self.button(surf, pygame.Rect(x, y, 112, h), "Clear jam" if self.jams else "Clear faults", self.clear_faults,
+                    "on" if self.jams else "plain")
+        x += 122
+        armed = time.monotonic() - self.release_armed < 2
+        self.button(surf, pygame.Rect(x, y, 146, h), "Click to confirm" if armed else "Release motors", self.release, "danger")
+        tk = self.link.recorder()
+        if tk and tk["state"] != "idle":  # the Teensy is recording or replaying
+            rec = tk["state"] == "rec"
+            cx, cy = x + 146 + 26, y + h // 2
+            pygame.draw.circle(surf, RED_HI if rec else GREEN, (cx, cy), 7)
+            text(surf, "REC %.1f s" % tk["at"] if rec else "REPLAY %.1f / %.1f s" % (tk["at"], tk["len"]),
+                 (cx + 14, cy), 13, RED_HI if rec else GREEN, True, "midleft")
+        sf = pygame.Rect(bar.right - 14 - 76, y, 76, h)  # Speed %, 1-100: Enter or click away applies it
+        self.field(surf, sf, "speed")
+        text(surf, "%", (sf.right - 12, sf.centery), 15, MUTED, anchor="midright")
+        text(surf, "Speed", (sf.x - 10, sf.centery), 13, BEIGE, True, "midright")
+
+
+    def draw_scene2d(self, surf, area):
+        """The side view: the drawing the tip is dragged in (WiFi)."""
         L = self.lengths()
         R = sum(L)
         s = max(0.05, min((area.w - 60) / (1.4 * R), (area.h - 50) / (1.15 * R + self.cfg["table"])))
@@ -1197,32 +1406,180 @@ class App:
                  (area.centerx, area.y + 18), 13, MUTED, anchor="center")
         surf.set_clip(None)
 
-        bar = pygame.Rect(c.x, c.bottom - BAR, c.w, BAR)
-        pygame.draw.line(surf, LINE, (bar.x + 14, bar.y), (bar.right - 14, bar.y))
-        x, y, h = bar.x + 14, bar.y + 12, 40
-        self.button(surf, pygame.Rect(x, y, 176, h), "CONTROL  ON" if self.control else "CONTROL  OFF",
-                    lambda: self.set_control(not self.control), "on" if self.control else "plain", 15, True)
-        x += 186
-        self.button(surf, pygame.Rect(x, y, 80, h), "Idle", self.idle)
-        x += 90
-        self.button(surf, pygame.Rect(x, y, 96, h), "Home all", self.home)
-        x += 106
-        self.button(surf, pygame.Rect(x, y, 112, h), "Clear jam" if self.jams else "Clear faults", self.clear_faults,
-                    "on" if self.jams else "plain")
-        x += 122
-        armed = time.monotonic() - self.release_armed < 2
-        self.button(surf, pygame.Rect(x, y, 146, h), "Click to confirm" if armed else "Release motors", self.release, "danger")
-        tk = self.link.recorder()
-        if tk and tk["state"] != "idle":  # the Teensy is recording or replaying
-            rec = tk["state"] == "rec"
-            cx, cy = x + 146 + 26, y + h // 2
-            pygame.draw.circle(surf, RED_HI if rec else GREEN, (cx, cy), 7)
-            text(surf, "REC %.1f s" % tk["at"] if rec else "REPLAY %.1f / %.1f s" % (tk["at"], tk["len"]),
-                 (cx + 14, cy), 13, RED_HI if rec else GREEN, True, "midleft")
-        sf = pygame.Rect(bar.right - 14 - 76, y, 76, h)  # Speed %, 1-100: Enter or click away applies it
-        self.field(surf, sf, "speed")
-        text(surf, "%", (sf.right - 12, sf.centery), 15, MUTED, anchor="midright")
-        text(surf, "Speed", (sf.x - 10, sf.centery), 13, BEIGE, True, "midright")
+    # ---------- 3D view (radio): X forward, Y left, Z up, the table at z = 0 ----------
+
+    def cam_vectors(self):
+        """Camera direction (towards the viewer), screen right and screen up, from azimuth and elevation."""
+        az, el = math.radians(self.cam[0]), math.radians(self.cam[1])
+        c = (math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el))
+        r = (-math.sin(az), math.cos(az), 0.0)
+        u = (-math.sin(el) * math.cos(az), -math.sin(el) * math.sin(az), math.cos(el))
+        return c, r, u
+
+    def home_view(self):
+        self.cam_goal = list(CAM_HOME)
+
+    def world(self, planar, theta):
+        """A point of the side-view chain (x forward, y up from the shoulder axis), turned by the turret."""
+        t = math.radians(theta)
+        return (planar[0] * math.cos(t), planar[0] * math.sin(t), self.cfg["table"] + planar[1])
+
+    def draw_pose3d(self, layer, g, theta, roll, grip, col, alpha, P):
+        """One arm pose on the layer; returns the screen points of shoulder, elbow, wrist and tip."""
+        L, rgba = self.lengths(), (*col, alpha)
+        W = [self.world(q, theta) for q in fk(g, L)]
+        t = [b - a for a, b in zip(W[2], W[3])]
+        n = math.sqrt(sum(v * v for v in t)) or 1
+        t = [v / n for v in t]
+        palm = [w - 26 * v for w, v in zip(W[3], t)]
+        th = math.radians(theta)
+        n0 = (-math.sin(th), math.cos(th), 0.0)  # across the arm's plane
+        j0 = cross(n0, t)                         # in the plane, across the tool: the jaws at roll 0
+        tj = cross(t, j0)
+        rr = math.radians(roll)
+        jaw = [a * math.cos(rr) + b * math.sin(rr) for a, b in zip(j0, tj)]
+        spread = 5 + 12 * grip / 100
+        segs = [(W[0], W[1], 64), (W[1], W[2], 50), (W[2], palm, 38)]
+        for sgn in (1, -1):
+            segs.append(([p + sgn * spread * j for p, j in zip(palm, jaw)],
+                         [p + sgn * spread * 0.6 * j for p, j in zip(W[3], jaw)], 9))
+        s = self.view3d[2]
+        for a, b, w in sorted(segs, key=lambda sg: P(sg[0])[2] + P(sg[1])[2]):  # far first
+            pa, pb = P(a)[:2], P(b)[:2]
+            pw = max(3, int(w * s))
+            pygame.draw.line(layer, rgba, pa, pb, pw)
+            pygame.draw.circle(layer, rgba, pa, pw / 2)
+            pygame.draw.circle(layer, rgba, pb, pw / 2)
+        return [P(w)[:2] for w in W]
+
+    def draw_scene3d(self, surf, area):
+        """The arm in 3D with the table grid and axes, a view cube top right; drag to orbit, wheel to zoom."""
+        self.area3d = area
+        if self.cam_goal:  # ease towards a view the cube asked for
+            dz = (self.cam_goal[0] - self.cam[0] + 180) % 360 - 180
+            self.cam[0] += 0.25 * dz
+            self.cam[1] += 0.25 * (self.cam_goal[1] - self.cam[1])
+            if abs(dz) < 0.2 and abs(self.cam_goal[1] - self.cam[1]) < 0.2:
+                self.cam, self.cam_goal = list(self.cam_goal), None
+        c, r, u = self.cam_vectors()
+        R = sum(self.lengths())
+        s = self.zoom3d * min(area.w, area.h) / (1.45 * R)
+        pivot = (0.3 * R, 0.0, self.cfg["table"] + 0.15 * R)
+        cx, cy = area.centerx, area.centery + 0.04 * area.h
+        self.view3d = (cx, cy, s)
+
+        def P(p):
+            d = [a - b for a, b in zip(p, pivot)]
+            return (cx + s * dot(d, r), cy - s * dot(d, u), dot(d, c))
+
+        surf.set_clip(area.inflate(-4, -4))
+        g0 = 100 * int(R / 100 + 2)
+        for k in range(-g0, g0 + 1, 100):  # the table, a 100 mm grid
+            pygame.draw.line(surf, GRID, P((k, -g0, 0))[:2], P((k, g0, 0))[:2])
+            pygame.draw.line(surf, GRID, P((-g0, k, 0))[:2], P((g0, k, 0))[:2])
+        ring = [P((R * math.cos(a), R * math.sin(a), self.cfg["table"]))[:2] for a in
+                (i * math.pi / 32 for i in range(65))]
+        pygame.draw.lines(surf, LINE, False, ring, 1)  # full reach, at the shoulder's height
+        for vec, col, name in (((450, 0, 0), AXIS_X, "X"), ((0, 450, 0), AXIS_Y, "Y"), ((0, 0, 450), AXIS_Z, "Z")):
+            a, b = P((0, 0, 0))[:2], P(vec)[:2]
+            pygame.draw.line(surf, col, a, b, 2)
+            text(surf, name, (b[0] + 4, b[1] - 8), 13, col, True)
+        base = [P((rad * math.cos(a), rad * math.sin(a), z))[:2] for rad, z in ((75, 0), (40, self.cfg["table"]))
+                for a in (i * math.pi / 12 for i in range(24))]
+        pygame.draw.polygon(surf, (44, 32, 32), hull(base))
+        pygame.draw.lines(surf, LINE, True, base[24:], 1)
+
+        if self.layer is None or self.layer.get_size() != surf.get_size():
+            self.layer = pygame.Surface(surf.get_size(), pygame.SRCALPHA)
+        self.layer.fill((0, 0, 0, 0))
+        meas = self.measured()
+        roll_meas = self.cfg["sign4"] * self.link.motors[JOINTS[3][1]].deg if meas else self.roll
+        if self.control:
+            if meas:
+                self.draw_pose3d(self.layer, meas, self.turret, roll_meas, self.grip, RED_HI, 95, P)
+            pose, pts = self.g, self.draw_pose3d(self.layer, self.g, self.turret, self.roll, self.grip, BEIGE, 255, P)
+        else:  # idle: follows the telemetry and breathes
+            pose = meas or self.zero()
+            pts = self.draw_pose3d(self.layer, pose, self.turret, roll_meas, self.grip, BEIGE,
+                                   int(120 + 60 * math.sin(time.monotonic() * 2.2)), P)
+        ghost = self.master_pose() if self.link.master_online() else None
+        if ghost:  # where the master sends the arm
+            t = self.master_offset(0)
+            tl = self.cfg["turret_limit"]
+            self.draw_pose3d(self.layer, ghost, clamp(t, -tl, tl) if t is not None else self.turret, self.pot_roll(),
+                             self.master_grip(), AMBER, 90, P)
+        surf.blit(self.layer, (0, 0))
+        for i, p in enumerate(pts[:3]):
+            rad = (24, 20, 16)[i] * s + 4
+            pygame.draw.circle(surf, BG, p, rad)
+            pygame.draw.circle(surf, JOINTS[i][2], p, rad, 3)
+        for i, (_, cid, _) in enumerate(JOINTS):
+            if cid in self.jams:
+                self.draw_jam(surf, pts[i])
+        pygame.draw.circle(surf, DIM, pts[3], 7, 2)
+
+        tx = area.left + 78
+        self.draw_turret(surf, (tx, area.y + 64))
+        dial = pygame.Rect(tx - 64, area.y + 22, 128, 170)
+        sw = pygame.Rect(area.right - 18 - 44, area.y + 14, 44, 24)
+        on = self.jam_enabled()
+        self.toggle(surf, sw, on, self.toggle_jam)
+        text(surf, "Jam detection %s" % ("on" if on else "off"), (sw.x - 10, sw.centery), 12, BEIGE if on else AMBER,
+             True, "midright")
+        jam_box = sw.inflate(150, 16).move(-75, 0)
+        cube_box = self.draw_viewcube(surf, (area.right - 92, area.y + 128), 36, c, r, u)
+        slots = [(area.x + 18, area.y + 205), (area.x + 18, area.y + 297),          # shoulder, elbow: left
+                 (area.right - 194, cube_box.bottom + 14), (area.right - 194, cube_box.bottom + 106)]  # pitch, roll
+        for i, (x, y) in enumerate(slots):  # fixed spots by the edges, so the cards never cover the arm in 3D
+            self.card(surf, i, pts[i], pygame.Rect(x, y, 176, 78))
+        text(surf, "Drag: orbit  ·  wheel: zoom  ·  click the cube: snap to a view", (area.x + 18, area.bottom - 22), 12,
+             MUTED)
+        if not meas:
+            text(surf, "No arm telemetry: showing the arm zero" if self.connected else "Not connected: showing the arm zero",
+                 (area.centerx, area.y + 18), 13, MUTED, anchor="center")
+        surf.set_clip(None)
+
+    def draw_viewcube(self, surf, ctr, half, c, r, u):
+        """The orientation cube of Fusion / Blender: the faces seen from the camera, labelled, clickable to snap
+        the view; the X / Y / Z triad at its corner; a home button for the iso view. Returns its bounding box."""
+        cx, cy = ctr
+
+        def S(v, k=1.0):
+            return (cx + half * k * dot(v, r), cy - half * k * dot(v, u))
+
+        hover = self.cube_face(pygame.mouse.get_pos())
+        self.cube_polys = []
+        for name, (nrm, verts, _) in CUBE_FACES.items():
+            f = dot(nrm, c)
+            if f <= 0.02:
+                continue
+            poly = [S(v) for v in verts]
+            self.cube_polys.append((name, poly))
+            shade = 0.45 + 0.55 * f
+            fill = RED if name == hover else tuple(int(a + (b - a) * shade) for a, b in zip(PANEL, (96, 80, 76)))
+            pygame.draw.polygon(surf, fill, poly)
+            pygame.draw.polygon(surf, LINE if name != hover else RED_HI, poly, 1)
+            if f > 0.35:
+                mx, my = sum(p[0] for p in poly) / 4, sum(p[1] for p in poly) / 4
+                text(surf, name, (mx, my), 10 if len(name) > 4 else 11, BEIGE, True, "center")
+        corner = S((-1, -1, -1))
+        for vec, col, name in (((1, 0, 0), AXIS_X, "X"), ((0, 1, 0), AXIS_Y, "Y"), ((0, 0, 1), AXIS_Z, "Z")):
+            end = S([-1 + 2.9 * vec[0], -1 + 2.9 * vec[1], -1 + 2.9 * vec[2]])
+            pygame.draw.line(surf, col, corner, end, 2)
+            text(surf, name, end, 11, col, True, "center")
+        home = pygame.Rect(cx - half * 2.1, cy - half * 2.1, 22, 22)
+        hx, hy = home.center
+        pygame.draw.polygon(surf, MUTED, [(hx - 7, hy), (hx, hy - 7), (hx + 7, hy)])
+        pygame.draw.rect(surf, MUTED, (hx - 5, hy, 10, 6))
+        self.hits.append((home, self.home_view))
+        return pygame.Rect(cx - half * 2.3, cy - half * 2.3, half * 4.6, half * 4.6)
+
+    def cube_face(self, pos):
+        """The view-cube face under pos (as last drawn), or None."""
+        for name, poly in getattr(self, "cube_polys", []):
+            if inside(pos, poly):
+                return name
+        return None
 
     def draw_config(self, surf, c):
         text(surf, "Configuration", (c.x + 18, c.y + 12), 20, BEIGE, True)
@@ -1320,6 +1677,12 @@ class App:
             text(surf, "%.1f s%s" % (secs, "  · loaded" if on else ""), (r.x + 110, y + 7), 13, MUTED)
             self.button(surf, pygame.Rect(r.right - 18 - 80, y, 80, 28), "Load", lambda n=n: self.load_take(n),
                         "on" if on else "plain", 12)
+            armed = self.del_armed[0] == n and time.monotonic() - self.del_armed[1] < 2
+            bin_r = pygame.Rect(r.right - 18 - 80 - 8 - (70 if armed else 32), y, 70 if armed else 32, 28)
+            self.button(surf, bin_r, "Delete" if armed else "", lambda n=n: self.delete_take(n),
+                        "danger" if armed else "plain", 12)
+            if not armed:
+                icon_trash(surf, bin_r.center, MUTED)
             y += 36
 
     def draw_master(self, surf, c):
@@ -1360,24 +1723,28 @@ class App:
         text(surf, "Wrist roll pot", (row.x, row.y), 14, BEIGE, True)
         text(surf, "GPIO1 · zero %.1f %% · follower's 0 at master %+g°" % (self.cfg["roll_zero"], self.cfg["roll_offset"]),
              (row.x + 118, row.y + 2), 12, DIM)
-        bar = pygame.Rect(row.x, row.y + 26, row.w - 136, 10)
+        bar = pygame.Rect(row.x, row.y + 26, row.w - 300, 10)
         pygame.draw.rect(surf, PANEL2, bar, border_radius=5)
         if ms:
             text(surf, "%.1f %%  ·  master %+.0f°  →  follower %+.0f°" % (ms["roll"], self.master_roll(), self.pot_roll()),
-                 (bar.right, row.y), 13, BEIGE, anchor="topright")
+                 (bar.x, bar.bottom + 5), 12, BEIGE)
             pygame.draw.rect(surf, RED_HI, (bar.x, bar.y, bar.w * clamp(ms["roll"], 0, 100) / 100, bar.h), border_radius=5)
         inv = self.cfg["sign_pr"] < 0
+        armed90 = time.monotonic() - self.roll90_armed < 2
+        self.button(surf, pygame.Rect(row.right - 120 - 154, row.y + 12, 144, 30),
+                    "Click to confirm" if armed90 else "Set roll +90°", self.capture_roll90, "on" if armed90 else "plain", 12)
         self.button(surf, pygame.Rect(row.right - 120, row.y + 12, 120, 30), "Inverted" if inv else "Normal",
                     lambda: self.flip("sign_pr"), "on" if inv else "plain", 12)
         row = row.move(0, 62)  # gripper button
         text(surf, "Gripper button", (row.x, row.y), 14, BEIGE, True)
-        text(surf, "GPIO7 to GND, a press closes / opens", (row.x + 118, row.y + 2), 12, DIM)
+        text(surf, "GPIO7 to GND: held, it turns the gripper; each press the other way", (row.x + 118, row.y + 2), 12, DIM)
         if ms:
-            closed = ms["grip"]
-            pill = pygame.Rect(row.x, row.y + 22, 110, 26)
-            pygame.draw.rect(surf, RED if closed else PANEL2, pill, border_radius=13)
-            pygame.draw.rect(surf, RED_HI if closed else LINE, pill, 1, border_radius=13)
-            text(surf, "closed" if closed else "open", pill.center, 13, BEIGE, True, "center")
+            held = ms.get("grip_held")
+            pill = pygame.Rect(row.x, row.y + 22, 150, 26)
+            pygame.draw.rect(surf, RED if held else PANEL2, pill, border_radius=13)
+            pygame.draw.rect(surf, RED_HI if held else LINE, pill, 1, border_radius=13)
+            text(surf, ("closing" if ms["grip"] else "opening") if held else
+                 "next: " + ("close" if not ms["grip"] else "open"), pill.center, 13, BEIGE, True, "center")
         y = row.bottom + 22
         pygame.draw.line(surf, LINE, (r.x + 18, y), (r.right - 18, y))
         sw = pygame.Rect(r.x + 18, y + 18, 52, 28)
@@ -1442,7 +1809,7 @@ class App:
         text(surf, "Motor tuning", (r.x + 18, r.y + 14), 15, BEIGE, True)
         text(surf, "Read fills the fields from the drivers. Amber = edited, not applied yet. Click a row for its step test.",
              (r.x + 18, r.y + 36), 12, MUTED)
-        x0, cw, fw = r.x + 160, 98, 88
+        x0, cw, fw = r.x + 160, 94, 86
         for k, name in enumerate(("Position Kp", "Position Ki", "Velocity Kp", "Velocity Ki", "Max current A")):
             text(surf, name, (x0 + k * cw, r.y + 64), 12, MUTED, True)
         for i, (name, cid, col) in enumerate(JOINTS):
@@ -1472,6 +1839,9 @@ class App:
             bx = x0 + 5 * cw + 4
             self.button(surf, pygame.Rect(bx, row.y + 6, 58, 32), "Read", lambda cid=cid: self.link.send("%d g" % cid), size=12)
             self.button(surf, pygame.Rect(bx + 66, row.y + 6, 64, 32), "Apply", lambda cid=cid: self.apply_motor(cid), "on", 12)
+            armed = self.zero_armed[0] == cid and time.monotonic() - self.zero_armed[1] < 2
+            self.button(surf, pygame.Rect(bx + 138, row.y + 6, 74, 32), "Confirm" if armed else "Set zero",
+                        lambda cid=cid: self.zero_motor(cid), "danger" if armed else "plain", 12)
         y = r.y + 84 + len(JOINTS) * 66 + 8
         self.button(surf, pygame.Rect(r.x + 20, y, 120, 36), "Read all", self.read_tuning)
         self.button(surf, pygame.Rect(r.x + 150, y, 120, 36), "Apply all", self.apply_all, "on")

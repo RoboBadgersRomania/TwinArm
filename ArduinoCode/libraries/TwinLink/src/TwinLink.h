@@ -50,7 +50,7 @@ inline uint32_t get32(const uint8_t *b) { return b[0] | b[1] << 8 | b[2] << 16 |
 
 // The master arm's state bytes as the app's line M,<turret>,<shoulder>,<elbow>,<wrist pitch>,<roll pot %>,<gripper>,<ok>.
 // Bytes: 4 joints as 14-bit MT6701 angles (0xFFFF = no reading, -1 deg in the line), the wrist-roll pot as 12 bits,
-// the gripper (1 = closed). ok: one bit per joint that answered.
+// the gripper button (bit 0: this press closes, else opens; bit 1: held). ok: one bit per joint that answered.
 inline void masterLine(const uint8_t *s, char *out, size_t n) {
   float d[4];
   int ok = 0;
@@ -59,7 +59,9 @@ inline void masterLine(const uint8_t *s, char *out, size_t n) {
     ok |= (v != 0xFFFF) << j;
     d[j] = v == 0xFFFF ? -1 : v * 360.0f / 16384;
   }
-  snprintf(out, n, "M,%.2f,%.2f,%.2f,%.2f,%.1f,%d,%d", d[0], d[1], d[2], d[3], get16(s + 8) * 100.0f / 4095, s[10], ok);
+  uint16_t pot = get16(s + 8);  // 0xFFFF: the master saw its wiper off the track, -1 in the line
+  snprintf(out, n, "M,%.2f,%.2f,%.2f,%.2f,%.1f,%d,%d", d[0], d[1], d[2], d[3], pot == 0xFFFF ? -1.0f : pot * 100.0f / 4095,
+           s[10], ok);
 }
 
 struct Ring {  // byte FIFO; the indices only grow, so used() stays right when they wrap
