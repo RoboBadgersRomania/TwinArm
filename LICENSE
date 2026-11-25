@@ -1,0 +1,39 @@
+BadgerLabs Proprietary License
+
+Copyright (c) 2026 BadgerLabs (RoboBadgers Romania). All rights reserved.
+
+1. Ownership. This repository and all material in it created by BadgerLabs,
+   including source code, scripts, schematics, PCB layouts, CAD and 3D files,
+   renders, documentation, notes, images, and the BadgerLabs name and badger
+   logo (together, the "Work"), are the exclusive property of BadgerLabs.
+
+2. No use, and no selling. The Work may not be used at all without prior
+   written permission from BadgerLabs. In particular, no one other than
+   BadgerLabs may sell, resell, rent, license, or otherwise commercially exploit
+   the Work or anything made from it (including boards, devices, kits, code,
+   designs or documents derived from the Work), and no written permission for
+   other uses ever includes the right to sell.
+
+3. No license granted. No right or license to the Work is granted, by
+   implication, estoppel or otherwise. Without prior written permission from
+   BadgerLabs you may not copy, modify, adapt, translate, distribute, publish,
+   display, sublicense, sell, manufacture from, or otherwise use the Work, in
+   whole or in part. Being able to view the Work (for example, on GitHub) does
+   not grant any right beyond viewing it there.
+
+4. Trademarks. "BadgerLabs" and the BadgerLabs badger logo are trademarks of
+   BadgerLabs. They may not be used without prior written permission.
+
+5. Third-party material. Material owned by others that is included in this
+   repository (listed in NOTICE.md) is not part of the Work, is not covered by
+   this license, and remains the property of its respective owners under their
+   own terms.
+
+6. No warranty. THE WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+   EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO
+   EVENT SHALL BADGERLABS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY
+   ARISING FROM, OUT OF OR IN CONNECTION WITH THE WORK OR ITS USE.
+
+Permission requests: contact the RoboBadgers Romania team through
+https://github.com/RoboBadgersRomania

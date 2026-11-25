@@ -1,6 +1,10 @@
+<p align="center"><img src="assets/badgerlabs-logo.png" width="160" alt="BadgerLabs logo"></p>
+
 <p align="center">
   <img src="Documentation/assets/banner.svg" alt="TwinArm: teach-by-demonstration 5-DOF robotic arm with a passive wireless master" width="100%">
 </p>
+
+<p align="center"><b>A BadgerLabs project</b> · RoboBadgers Romania</p>
 
 <p align="center">
   <img src="https://img.shields.io/badge/RoboChallenge-2026-8B0000?style=for-the-badge&labelColor=0B0B0B" alt="RoboChallenge 2026">
@@ -602,8 +606,15 @@ It stops, puts the starting gains back and holds on an overshoot above `--max-ov
 
 </details>
 
+## License
+
+© 2026 BadgerLabs · RoboBadgers Romania. All rights reserved. This project is proprietary: it may not be used, copied or sold without written permission from BadgerLabs. See [LICENSE](LICENSE) and [NOTICE.md](NOTICE.md) for third-party material.
+
 <br>
 
 <img src="Documentation/assets/divider.svg" width="100%" alt="">
 
 <p align="center"><sub>Built by <b>Team BadgerLabs</b> for RoboChallenge 2026</sub></p>
+
+---
+<sub>© 2026 BadgerLabs · RoboBadgers Romania. All rights reserved. See [LICENSE](LICENSE).</sub>
